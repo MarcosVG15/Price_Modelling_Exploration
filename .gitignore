@@ -1,0 +1,5 @@
+.env
+venv
+/data_files/
+.claude
+__pycache__
