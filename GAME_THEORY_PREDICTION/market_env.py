@@ -17,9 +17,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import HistGradientBoostingRegressor
+
 
 PRICE_COL = ("clean", "price")
 HORIZON = 52
@@ -63,9 +67,8 @@ class MarketEnv:
         return cls._CACHE[key]
 
 
-    def __init__(self, group_id , cluster_id, comp_prices, params, horizon=HORIZON, action_grid=ACTION_GRID):
+    def __init__(self, cluster_id, comp_prices, params, horizon=HORIZON, action_grid=ACTION_GRID):
         
-        self.group_id
         self.cluster_id = int(cluster_id)
         self.comp_prices = np.asarray(comp_prices, dtype=float)
         self.params = params
@@ -80,6 +83,7 @@ class MarketEnv:
         self.own_prime = 1.0
         self.own_feedback = params.get("buybox_feedback_median", 4.5)
         self.t = 0
+        self.competitor_strategy = "static"
 
     @classmethod
     def fit(cls, vn, cluster_id):
@@ -94,9 +98,9 @@ class MarketEnv:
         params["price_center"] = center
         params["price_scale"] = scale
         params["reference_price"] = float(np.median(comp_prices)) if comp_prices.size else 1.0
-        params.update(cls._estimate_demand(members, comp_prices))
         params.update(cls._estimate_buybox(members, comp_prices))
         params.update(cls._estimate_seasonality())
+        cls._estimate_conversion_rate()
 
         return cls(int(cluster_id), comp_prices, params)
 
@@ -114,28 +118,185 @@ class MarketEnv:
 
     #  in order to do this you can add the commaxx products to the vn and then find the cluster such that then you can train a logistic regressor to estimate the demand
     #  I will estimate using the conversion rate instead of raw orders
+    #
+    #  GLOBAL, category-agnostic CVR model. Trained once over the WHOLE own-catalog
+    #  panel and cached in cls._CVR_MODEL (every cluster's expected_demand reuses it).
+    #  Design forced by the data:
+    #    * The target (units/sessions) and weight (sessions) only exist in
+    #      sales_traffic_daily -- a seller report = own catalog only. Products are
+    #      split across segmentation terms, and any single term has too little price
+    #      movement to fit an elasticity curve, so we POOL across terms and train on
+    #      RELATIVE prices (price / per-category reference). The learned curve is
+    #      "CVR vs how expensive you are relative to typical", which transfers across
+    #      terms without the absolute-price-level mismatch that raw pooling causes.
+    #    * PRICE SOURCE: we drive off sales_traffic_daily (the full panel, ~260k rows)
+    #      and recover the realized price as ordered_product_sales / units_ordered.
+    #      offers_daily.landed_price only covers a few hundred rows, so inner-joining
+    #      it (the old approach) starved training down to ~67 rows. offers_daily is now
+    #      a LEFT JOIN that only supplies supplementary fields where present. On a
+    #      zero-sale day revenue/units is undefined, so we carry the nearest realized
+    #      price within the same asin+marketplace (ffill/bfill) -- the listing price
+    #      moves slowly, so an adjacent day's price is a good stand-in, and this keeps
+    #      the (important) zero-conversion observations in the training set.
+    #  members / comp_prices are accepted for backward-compat but not used.
+    _MIN_CVR_SAMPLES = 30
+    _MIN_PRICE_LEVELS = 5
+
     @classmethod
-    def _estimate_conversion_rate(cls , members, comp_prices, group_id):
+    def _estimate_conversion_rate(cls, members=None, comp_prices=None):
 
         if cls._CVR_MODEL is not None :
             return cls._CVR_MODEL
-        
 
         try:
             eng = _api_engine()
+            # Base table = sales_traffic_daily (one row per asin/marketplace/day,
+            # verified unique). offers_daily is pre-aggregated to one row per
+            # asin/marketplace/day before the LEFT JOIN so it can only enrich, never
+            # fan out and duplicate traffic rows. product_content is de-duplicated the
+            # same way, for product_type (the per-category price normaliser).
+            query = text("""
+                    SELECT
+                    t.asin,
+                    t.marketplace_id,
+                    t.data_date,
+
+                    t.units_ordered,
+                    t.sessions,
+                    t.ordered_product_sales,
+
+                    o.landed_price,
+                    o.listing_price_amount,
+                    o.shipping_amount,
+                    o.is_prime,
+                    o.seller_feedback_rating,
+                    o.seller_feedback_count,
+                    o.offer_position,
+
+                    p.product_type
+                    FROM sales_traffic_daily t
+                    LEFT JOIN (
+                        SELECT asin, marketplace_id, captured_at::date AS d,
+                               AVG(landed_price)          AS landed_price,
+                               AVG(listing_price_amount)  AS listing_price_amount,
+                               AVG(shipping_amount)       AS shipping_amount,
+                               BOOL_OR(is_prime)          AS is_prime,
+                               MIN(offer_position)        AS offer_position,
+                               MAX(seller_feedback_count) AS seller_feedback_count,
+                               AVG(seller_feedback_rating) AS seller_feedback_rating
+                        FROM offers_daily
+                        GROUP BY asin, marketplace_id, captured_at::date
+                    ) o
+                        ON o.asin = t.asin
+                    AND o.marketplace_id = t.marketplace_id
+                    AND o.d = t.data_date
+                    LEFT JOIN (
+                        SELECT DISTINCT ON (asin, marketplace_id)
+                               asin, marketplace_id, product_type
+                        FROM product_content
+                    ) p
+                        ON p.asin = t.asin
+                    AND p.marketplace_id = t.marketplace_id
+                    WHERE t.sessions IS NOT NULL AND t.sessions > 0
+                """)
+
             with eng.connect() as c:
-                df = pd.read_sql(text("""
-                    SELECT asin, captured_at, landed_price, is_buy_box_winner,
-                           is_fulfilled_by_amazon, is_prime, seller_feedback_rating
-                    FROM offers_daily
-                    WHERE landed_price IS NOT NULL
-                """), c)
-        except Exception:
-            cls._BUYBOX = default
-            return cls._BUYBOX
+                data = pd.read_sql(query, c)
+        except Exception as e:
+            print(e)
+            cls._CVR_MODEL = None
+            return cls._CVR_MODEL
+
+        if data.empty:
+            print("[_estimate_conversion_rate] no own-catalog traffic rows; using constant CVR")
+            cls._CVR_MODEL = None
+            return cls._CVR_MODEL
+
+        data = data.sort_values(["asin", "marketplace_id", "data_date"]).reset_index(drop=True)
+
+        units    = pd.to_numeric(data["units_ordered"], errors="coerce").fillna(0.0)
+        sessions = pd.to_numeric(data["sessions"], errors="coerce").fillna(0.0)
+        revenue  = pd.to_numeric(data["ordered_product_sales"], errors="coerce").fillna(0.0)
+
+        # Realized price = revenue / units on days that sold; carry the nearest such
+        # price into zero-sale days within the same asin+marketplace, then fall back to
+        # any observed competitive landed price.
+        data["price"] = revenue / units.where(units > 0)
+        data["price"] = (data.groupby(["asin", "marketplace_id"])["price"]
+                             .transform(lambda s: s.ffill().bfill()))
+        data["price"] = data["price"].fillna(pd.to_numeric(data["landed_price"], errors="coerce"))
+
+        # Per-category (product_type) reference price -> relative price. Fall back to
+        # the global median where a category has no usable price, so the ratio is
+        # always defined; asins that never sold at all sit at ratio 1.0.
+        global_ref = float(data["price"].median(skipna=True))
+        ref = (data.groupby("product_type")["price"].transform("median")
+                   .replace(0, np.nan).fillna(global_ref))
+        data["price"] = data["price"].fillna(ref).fillna(global_ref)
+
+        # Supplementary offer features: real where offers_daily matched, else the same
+        # defaults expected_demand/predict_cvr assume (FBA free shipping, own buy box,
+        # prime). This keeps the train-time feature distribution aligned with predict.
+        listing  = pd.to_numeric(data["listing_price_amount"], errors="coerce").fillna(data["price"])
+        shipping = pd.to_numeric(data["shipping_amount"], errors="coerce").fillna(0.0)
+        offerpos = pd.to_numeric(data["offer_position"], errors="coerce").fillna(1.0)
+        prime    = pd.to_numeric(data["is_prime"], errors="coerce").fillna(1.0)
+
+        fb_count = pd.to_numeric(data["seller_feedback_count"], errors="coerce")
+        fb_rating = pd.to_numeric(data["seller_feedback_rating"], errors="coerce")
+        seller_score = np.log(fb_count + 1) * fb_rating
+        default_ss = float(np.log(100 + 1) * 4.5)   # matches predict_cvr's fallback
+        seller_score = seller_score.fillna(seller_score.median()).fillna(default_ss)
+
+        # Same 7-feature vector as predict_cvr (names/order MUST match). On this panel
+        # min/listing collapse onto price (no competitor prices), which is harmless --
+        # the price->CVR signal now comes from the huge cross-product price variation.
+        X_df = pd.DataFrame({
+            'price_ratio': data["price"] / ref,
+            'min_price_ratio': data["price"] / ref,
+            'listing_ratio': listing / ref,
+            'shipping_ratio': shipping / ref,
+            'daily_average_offer_position': offerpos,
+            'prime_availability': prime,
+            'seller_score': seller_score,
+        })
+        # Target CVR as a FRACTION (units/sessions). Clip the rare >100% (multi-unit
+        # orders / data artifacts) into [0, 1] to match predict_cvr's output range.
+        y = np.clip((units / sessions.where(sessions > 0)).to_numpy(dtype=float), 0.0, 1.0)
+        weights = sessions.to_numpy(dtype=float)
+
+        # Drop rows with an unusable target/weight before fitting.
+        good = np.isfinite(y) & np.isfinite(weights) & (weights > 0)
+        X_df, y, weights = X_df[good].reset_index(drop=True), y[good], weights[good]
+
+        # Degeneracy guards: a booster fit on too few samples, or on prices that never
+        # move, learns nothing about price response. Fall back loudly to the constant-
+        # CVR path (expected_demand uses 0.03) instead of shipping a garbage curve.
+        n_prices = X_df['price_ratio'].round(2).nunique() if not X_df.empty else 0
+        if len(X_df) < cls._MIN_CVR_SAMPLES:
+            print(f"[_estimate_conversion_rate] only {len(X_df)} usable rows "
+                  f"(need >= {cls._MIN_CVR_SAMPLES}); not enough own-catalog data -- using constant CVR")
+            cls._CVR_MODEL = None
+            return cls._CVR_MODEL
+        if n_prices < cls._MIN_PRICE_LEVELS:
+            print(f"[_estimate_conversion_rate] price_ratio takes only {n_prices} distinct level(s) across "
+                  f"{len(X_df)} rows; cannot learn a price->CVR curve -- using constant CVR")
+            cls._CVR_MODEL = None
+            return cls._CVR_MODEL
+
+        print(f"[_estimate_conversion_rate] fitting on {len(X_df)} (asin, marketplace, day) rows across "
+              f"{data['product_type'].nunique()} product types, {n_prices} distinct price_ratio levels "
+              f"(weighted mean CVR = {np.average(y, weights=weights):.4f})")
+
+        # Fit a non-linear gradient booster using traffic volume as weights
+        cls._CVR_MODEL = HistGradientBoostingRegressor(random_state=1, max_iter=200)
+        cls._CVR_MODEL.fit(X_df, y, sample_weight=weights)
+
+        return cls._CVR_MODEL
 
 
-        
+
+
     @classmethod
     def _estimate_buybox(cls, members, comp_prices):
         if cls._BUYBOX is not None:
@@ -247,13 +408,14 @@ class MarketEnv:
 
 
     # ---- RL interface --------------------------------------------------
-    def reset(self, target_product, start_week=None):
+    def reset(self, target_product, start_week=None, competitor_strategy="static"):
         row = target_product.iloc[0]
         self.target = target_product
         raw = float(pd.to_numeric(pd.Series([row[PRICE_COL]]), errors="coerce").iloc[0])
         self.own_price = raw * self.params["price_scale"] + self.params["price_center"]
         self.own_quality = self._quality(row)
         self.t = 0
+        self.competitor_strategy = competitor_strategy
         if start_week is None:
             start_week = pd.Timestamp.today().isocalendar().week
         self.start_week = int(start_week)
@@ -263,7 +425,7 @@ class MarketEnv:
 
     def step(self, action):
         self.own_price = self.own_price * self.action_grid[int(action)]
-        self.comp_prices = self._competitor_prices(self.t)
+        self.comp_prices = self._competitor_prices(self.competitor_strategy)
         units = self.expected_demand(self.own_price)
         reward = self._profit(self.own_price, units)
         self.last_units = float(units)
@@ -311,40 +473,92 @@ class MarketEnv:
         return 1.0 / (1.0 + np.exp(-z))
 
     def _competitor_prices(self, strategy_type):
+
+
+        base_prices = self.comp_prices
+        reference = self.params["reference_price"]
+        floor = self.params.get("comp_floor_price", reference * 0.7)
+
         match strategy_type:
             case "static":
-                return self.comp_prices
-                
+                return base_prices
+
             case "undercutter":
                 floor = self.params.get("comp_floor_price", self.params["reference_price"] * 0.7)
                 return np.maximum(self.own_price - 0.01, floor)
-                
+
             case "matcher":
                 floor = self.params.get("comp_floor_price", self.params["reference_price"] * 0.7)
                 return np.maximum(self.own_price, floor)
-                
-            case "tit_for_tat":
-                # Game-theory punishment logic
-                ...
-                
-            case "promo_cycler":
-                # Stochastic promotion logic
-                ...
-                
-            case "SL":
-                pass
 
-            case "RL" :
-                pass 
-                
+            case "tit_for_tat" | "SL" | "RL":
+                # Stubbed out -- fail loudly rather than silently returning None,
+                # which would otherwise propagate into comp_prices and crash later
+                # (e.g. in _competitor_reference) with a confusing error far from
+                # the actual cause.
+                raise NotImplementedError(f"competitor strategy '{strategy_type}' is not implemented yet")
+
+            case "promo_cycler":
+                rng = np.random.default_rng(seed=int(self.t))
+
+                is_promo_week = (self.t % 10) in [0, 1]
+
+                if is_promo_week:
+                    # Drop prices stochastically by 15% to 25% during the promotion
+                    promo_discount = rng.uniform(0.75, 0.85)
+                    return np.maximum(base_prices * promo_discount, floor)
+                else:
+                    # Standard pricing with slight daily market noise (+/- 2%)
+                    noise = rng.uniform(0.98, 1.02, size=base_prices.shape)
+                    return np.maximum(base_prices * noise, floor)
+
             case _:
                 print(f"Strategy {strategy_type} not recognized. Falling back to static.")
-                return self.comp_prices
+                return base_prices
 
     # ---- helpers -------------------------------------------------------
+    def predict_cvr(self, own_price, comp_ref=None):
+        """Model's predicted conversion rate at a given own price. Single source of
+        truth for the CVR feature vector, shared by expected_demand and the backtest
+        so the two can never drift out of sync on feature names/order."""
+        if self._CVR_MODEL is None:
+            return 0.03
+
+        if comp_ref is None:
+            comp_ref = self._competitor_reference()
+
+        feedback_count_default = self.params.get("buybox_feedback_median", 100.0)
+        feedback_count_log = np.log(feedback_count_default + 1)
+        seller_score = feedback_count_log * self.own_feedback
+
+        # Normalise by this cluster's reference price so the features are in the
+        # same "fraction of typical price" space the model was trained on (train
+        # divides by the per-product_type median; here we divide by the cluster
+        # reference, the predict-time analogue). Feature names/order must match
+        # _estimate_conversion_rate's X_df exactly.
+        ref = self.params.get("reference_price") or 1.0
+        X_df = pd.DataFrame([{
+            'price_ratio': float(own_price / ref),
+            'min_price_ratio': float(comp_ref / ref),
+            'listing_ratio': float(own_price / ref),
+            'shipping_ratio': 0.0,                  # Assuming FBA free shipping
+            'daily_average_offer_position': 1.0,    # Assuming Buy Box placement to convert
+            'prime_availability': float(self.own_prime),
+            'seller_score': float(seller_score)
+        }])
+
+        return float(np.clip(self._CVR_MODEL.predict(X_df)[0], 0.0, 1.0))
+
     def expected_demand(self, own_price):
         comp_ref = self._competitor_reference()
-        return self._buybox_prob(own_price, comp_ref) * self._logit_demand(own_price)
+        bb_prob = self._buybox_prob(own_price, comp_ref)
+        cvr = self.predict_cvr(own_price, comp_ref)
+
+        market_size = self.params.get("market_size", 1000)
+        sessions = market_size * self._seasonal_multiplier(self.t)
+
+        # Expected demand is the combination of visibility, intent, and traffic
+        return sessions * bb_prob * cvr
 
     def _profit(self, own_price, units):
         return (own_price - self.params["cost"]) * units

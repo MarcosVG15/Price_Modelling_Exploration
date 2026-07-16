@@ -238,7 +238,7 @@ class matrix_factorization :
             G, weight="weight", resolution=resolution, seed=42)
 
         labels = np.zeros(n, dtype=int)
-        for cid, comm in enumerate(communities):
+        for cid, comm in tqdm(enumerate(communities)):
             for node in comm:
                 labels[node] = cid
 

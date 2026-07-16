@@ -18,9 +18,13 @@ def build_vn(search_term="Headphones", k=1, resolution=1.0):
     path = os.path.join(ROOT, f"data_files/all_feature_data_{search_term}.csv")
     data = pd.read_csv(path, header=[0, 1], low_memory=False)
     data = data.drop(columns=data.columns[0])
+
     vn = matrix_factorization(data)
+
     vn.matrix_factorization_tf_idf()
+
     vn.svd_product_communities(k=k, resolution=resolution)
+
     return vn, data
 
 
@@ -32,16 +36,29 @@ def pick_target(data, random_state=2):
 
 
 def main():
+    print("building vn ")
     vn, data = build_vn()
+
+    
+    
+    print("getting target ")
     target = pick_target(data)
+
+    asin_col = ("clean", "asin")
+    target_asin = target[asin_col].iloc[0] if asin_col in target.columns else None
+    print("target ASIN:", target_asin if pd.notna(target_asin) else "unresolved")
 
     print("target : " , target )
     game = pricing_game(target, vn)
+
     print("target cluster:", game.cluster_id)
+
+    game.test()
 
     game.train(episodes=2000)
     # Run the assessment after training
     assessment = game.assess()
+
 
     print("--- REVEALING THE BLACK BOX ---")
     print(f"Starting Price: ${assessment['start_price']:.2f}")

@@ -274,7 +274,8 @@ def coalesce_concepts(df, spec_cols):
         groups.setdefault(concept_key(c), []).append(c)
     concepts = {}
     sources = {}
-    for concept, cols in groups.items():
+    for concept, cols in tqdm(groups.items(), total=len(groups),
+                              desc="  coalescing concepts"):
         # order by coverage so the best-filled column leads the bfill
         cols = sorted(cols, key=lambda c: df[c].notna().mean(), reverse=True)
         concepts[concept] = df[cols].bfill(axis=1).iloc[:, 0]

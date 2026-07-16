@@ -1,4 +1,5 @@
 import numpy as np
+from tqdm import tqdm
 
 from market_env import MarketEnv
 
@@ -9,6 +10,9 @@ class pricing_game:
         q = int(fit.new_product_indices[0])
         self.cluster_id = int(fit.product_labels[q])
         self.env = MarketEnv.for_cluster(vn, self.cluster_id)
+        self.vn = vn
+
+
         self.target = target_product
 
         self.bins = bins
@@ -17,6 +21,16 @@ class pricing_game:
         self.low = np.array([0.0, 0.0, 0.0, 0.0])
         self.high = np.array([2.0, 2.0, 1.0, 1.0])
         self.history = []
+
+
+    def test(self):
+        # _estimate_conversion_rate now runs automatically inside MarketEnv.fit()
+        # (triggered by for_cluster() in __init__ above), so there's nothing to
+        # trigger here anymore -- this just reports whether a real model got fit
+        # for this process, or whether expected_demand will use the constant fallback.
+        status = "fitted" if MarketEnv._CVR_MODEL is not None else "constant fallback (see log above)"
+        print(f"CVR model status: {status}")
+
 
     def _key(self, state):
         s = np.clip((np.asarray(state) - self.low) / (self.high - self.low), 0.0, 1.0)
@@ -36,7 +50,8 @@ class pricing_game:
     def train(self, episodes=3000, alpha=0.1, gamma=0.95,
               epsilon=1.0, epsilon_min=0.05, decay=0.999):
         self.history = []
-        for _ in range(episodes):
+        pbar = tqdm(range(episodes), desc="training", unit="ep")
+        for _ in pbar:
             start_week = int(self.rng.integers(1, 53))
             state = self.env.reset(self.target, start_week=start_week)
             done = False
@@ -51,6 +66,7 @@ class pricing_game:
                 total += r
             epsilon = max(epsilon_min, epsilon * decay)
             self.history.append(total)
+            pbar.set_postfix(avg_reward=f"{np.mean(self.history[-50:]):.1f}", eps=f"{epsilon:.3f}")
         return self.history
 
     def best_policy(self):

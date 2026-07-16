@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from datetime import date, timedelta
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -233,40 +234,44 @@ def load_node_trees():
             "FROM node_trees"), c)
 
 
-def map_search_term_to_browse_nodes(search_term, granularity, nt=None, sim_threshold=0.50):
-    """Map (search_term, granularity) -> best browse node per marketplace.
+def map_search_term_to_browse_nodes(search_term, granularity, nt=None, sim_threshold=0.70):
+    """Map (search_term, granularity) -> EVERY qualifying browse node per marketplace.
 
     Matching is semantic: translate every node name to English, embed it, and
-    cosine-compare to the embedded search term. `granularity` mirrors the scrape's
-    segmentation depth (1..3): the finest granularity (3) keeps the matched node;
-    coarser granularities climb toward the root so the returned subtree is broader
-    (climb = 3 - granularity parents).
+    cosine-compare to the embedded search term. Real product types are scattered
+    across many sibling leaf nodes in Amazon's tree (e.g. "sport earbuds", "TV
+    headphones", "kids' ear protection" are separate leaves, not descendants of one
+    "Headphones" node), so keeping only the single best match per marketplace and
+    climbing misses most of them. Instead every node scoring >= sim_threshold is
+    kept, each used as its own subtree root (no climbing): a strong, specific leaf
+    match (e.g. "Casques de protection auditive" / hearing-protection headphones)
+    is often filed under an unrelated broader parent (e.g. "Baby Safety", alongside
+    baby monitors) purely as an Amazon merchandising quirk, and climbing from it
+    would pull in that whole unrelated sibling subtree. With many sibling leaves
+    matched directly, climbing is no longer needed to broaden coverage -- it only
+    adds this kind of contamination. `granularity` is accepted for interface
+    symmetry with the scrape-side segmentation but no longer affects node scope.
 
-    Returns {marketplace_id: {"node_id","name","match_name","score"}}.
+    Returns {marketplace_id: [{"node_id","name","match_name","score"}, ...]}
+    (list sorted by score, descending).
     """
     if nt is None:
         nt = load_node_trees()
     nt = nt.copy()
     nt["bid"] = nt["browse_node_id"].astype(str)
-    nt["pid"] = nt["parent_browse_node_id"].astype(str)
 
     q = _embed(_to_english(search_term))
     nt["score"] = [_cos(q, _embed(_to_english(nm))) for nm in nt["name"]]
 
-    parent_of = dict(zip(nt["bid"], nt["pid"]))
-    name_of = dict(zip(nt["bid"], nt["name"]))
-    climb = max(0, 3 - int(granularity))
-
     out = {}
     for mkt, sub in nt.groupby("marketplace_id"):
-        best = sub.sort_values("score", ascending=False).iloc[0]
-        if best["score"] < sim_threshold:
+        qualifying = sub[sub["score"] >= sim_threshold].sort_values("score", ascending=False)
+        if qualifying.empty:
             continue
-        node = best["bid"]
-        for _ in range(climb):
-            node = parent_of.get(node, node)
-        out[mkt] = {"node_id": node, "name": name_of.get(node, best["name"]),
-                    "match_name": best["name"], "score": float(best["score"])}
+        matches = [{"node_id": row["bid"], "name": row["name"],
+                    "match_name": row["name"], "score": float(row["score"])}
+                   for _, row in qualifying.iterrows()]
+        out[mkt] = matches
     return out
 
 
@@ -456,7 +461,7 @@ def build_sp_api_feature_frame(products, template_columns, keyword_id=None,
 
 
 def add_sp_api_products_to_csv(search_term, granularity, csv_path=None,
-                               node_sim_threshold=0.50, attr_sim_threshold=0.62,
+                               node_sim_threshold=0.70, attr_sim_threshold=0.62,
                                dry_run=False):
     """End-to-end: map -> subtree -> select SP-API products -> append to the CSV.
 
@@ -471,13 +476,18 @@ def add_sp_api_products_to_csv(search_term, granularity, csv_path=None,
     nt = load_node_trees()
     roots = map_search_term_to_browse_nodes(search_term, granularity, nt=nt,
                                             sim_threshold=node_sim_threshold)
-    node_ids_by_mkt = {mkt: collect_subtree(nt, mkt, info["node_id"])
-                       for mkt, info in roots.items()}
+    node_ids_by_mkt = {}
+    for mkt, matches in roots.items():
+        ids = set()
+        for info in matches:
+            ids |= collect_subtree(nt, mkt, info["node_id"])
+        node_ids_by_mkt[mkt] = ids
     products = fetch_products_under_nodes(node_ids_by_mkt)
 
     summary = {
         "search_term": search_term, "granularity": granularity,
         "roots": roots,
+        "n_matched_nodes": {m: len(v) for m, v in roots.items()},
         "subtree_sizes": {m: len(s) for m, s in node_ids_by_mkt.items()},
         "n_products": int(len(products)),
     }
@@ -491,14 +501,42 @@ def add_sp_api_products_to_csv(search_term, granularity, csv_path=None,
                                           keyword_id=keyword_id,
                                           attr_sim_threshold=attr_sim_threshold)
 
+    # Own-catalog products can list on multiple marketplaces (which this CSV
+    # schema doesn't track) and this function may be re-run on the same search
+    # term -- both would silently re-append rows for ASINs already in the CSV.
+    # Collapse to one row per new ASIN and skip ones already present.
+    id_col = ("clean", "asin")
+    if id_col in new_rows.columns:
+        new_rows = new_rows.drop_duplicates(subset=[id_col], keep="first")
+        if id_col in base.columns:
+            existing = set(base[id_col].dropna())
+            new_rows = new_rows[~new_rows[id_col].isin(existing)]
+    if new_rows.empty:
+        summary["appended"] = 0
+        summary["csv_rows"] = int(len(base))
+        return summary, products
+
     # Normalize the new rows with the SAME params the saved CSV was built with, so
     # the appended values live on the same scale (the sidecar is the one market_env
-    # already reads: all_feature_data_<term>.params.json).
+    # already reads: all_feature_data_<term>.params.json). asin/ean are pulled out
+    # first and reattached untouched: Normalizer.transform() has no fitted spec for
+    # them (they're absent from this sidecar), so its "unseen feature" fallback
+    # auto-detects a type with no identifier safeguard -- to_number()'s regex pulls
+    # digit substrings out of alphanumeric ASINs, so they read as "numeric" and get
+    # robust-scaled into garbage floats, destroying the very identifier the fold-in
+    # exists to bridge on. attach_real_identifiers() in main() avoids this the same
+    # way: run identifier attachment AFTER normalization, never before.
+    id_cols = [c for c in (("clean", "asin"), ("clean", "ean")) if c in new_rows.columns]
+    identifiers = new_rows[id_cols].copy() if id_cols else None
+
     params_path = Path(csv_path).with_suffix("").as_posix() + ".params.json"
     if os.path.exists(params_path):
         new_rows = Normalizer.load(params_path).transform(new_rows)
     else:
         print(f"[fold_in] no params sidecar at {params_path}; appending un-normalized")
+
+    if identifiers is not None:
+        new_rows[id_cols] = identifiers
 
     combined = pd.concat([base, new_rows], ignore_index=True)
     combined.to_csv(csv_path, index=False)
@@ -507,8 +545,15 @@ def add_sp_api_products_to_csv(search_term, granularity, csv_path=None,
     return summary, products
 
 
-def main():
-
+def main(lookback_days=45):
+    """
+    lookback_days: how far back (in days) to pull scraped listings from. A narrow
+    window captures a more homogeneous slice of the catalog (fewer distinct
+    sellers/product types), which raises feature-presence density -- TF-IDF then
+    suppresses most of those near-ubiquitous features at once, embeddings collapse
+    together, and svd_product_communities' Louvain step slows way down chewing
+    through a near-flat modularity landscape. Widen this (e.g. 90) if that happens.
+    """
 
     #  i need this to load from the database
     #  this will be then run on a two week basis in order to be able to always have up to date files in the actual systen
@@ -516,9 +561,10 @@ def main():
 
     granularity = 2
     search_term = 'Headphones'
+    time_frame = date.today() - timedelta(days=lookback_days)
 
     keyword_ids = extract_keyword_ids(granularity, search_term)
-    paragraphs = paragraph_extraction(keyword_ids).extract_all_data()
+    paragraphs = paragraph_extraction(keyword_ids, time_frame=time_frame).extract_all_data()
     print("paragraphs shape:", paragraphs.shape)
 
     # pre process the paragraphs such that i will have feature vectors instead of just paragrphs
@@ -526,7 +572,7 @@ def main():
     print(para_data.head())
 
 
-    grouped, (clean, data_dict) = clean_system(keyword_ids).run()
+    grouped, (clean, data_dict) = clean_system(keyword_ids, time_frame=time_frame).run()
     print("grouped shape:", grouped.shape)
 
     # reduce the vectors such that i dont have any duplicate between it and paragraphs data
@@ -563,11 +609,20 @@ def main():
     # Needs a GPU: build_sp_api_feature_frame() constructs textual_feature_extractors,
     # whose zero-shot classifier is pinned to device=0.
     summary, _ = add_sp_api_products_to_csv(search_term, granularity)
-    print(f"[sp_api fold-in] matched nodes: { {m: r['name'] for m, r in summary['roots'].items()} }")
+    matched_names = {m: [r["match_name"] for r in matches] for m, matches in summary["roots"].items()}
+    print(f"[sp_api fold-in] matched nodes per marketplace: {matched_names}")
+    print(f"[sp_api fold-in] node counts: {summary['n_matched_nodes']}")
     print(f"[sp_api fold-in] subtree sizes: {summary['subtree_sizes']}")
     print(f"[sp_api fold-in] appended {summary.get('appended', 0)} SP-API products "
           f"({summary['n_products']} found) -> csv now {summary.get('csv_rows', '?')} rows")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    # python load_data_excel.py [lookback_days]
+    # No arg -> fall through to main()'s own default (single source of truth),
+    # so the signature default can't be silently overridden here.
+    if len(sys.argv) > 1:
+        main(lookback_days=int(sys.argv[1]))
+    else:
+        main()
