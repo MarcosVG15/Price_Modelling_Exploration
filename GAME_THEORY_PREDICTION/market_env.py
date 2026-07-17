@@ -53,6 +53,7 @@ class MarketEnv:
 
     _CACHE = {}
     _BUYBOX = None
+    _BUYBOX_MODEL = None
     _SEASONALITY = None
     _CVR_MODEL = None
 
@@ -60,17 +61,25 @@ class MarketEnv:
 
     #  most of these methods are used to provide an estimate of a product that was never here before so we can have a basis on where to start.
     @classmethod
-    def for_cluster(cls, vn, cluster_id):
+    def for_cluster(cls, vn, cluster_id, strategy="static"):
         key = int(cluster_id)
         if key not in cls._CACHE:
-            cls._CACHE[key] = cls.fit(vn, key)
-        return cls._CACHE[key]
+            cls._CACHE[key] = cls.fit(vn, key, strategy=strategy)
+        env = cls._CACHE[key]
+        # The env is cached per cluster and may be shared across pricing_game
+        # instances that each want a different competitor. Set the requested
+        # strategy on the (possibly cached) env so the caller always gets theirs.
+        env.competitor_strategy = strategy
+        return env
 
 
-    def __init__(self, cluster_id, comp_prices, params, horizon=HORIZON, action_grid=ACTION_GRID):
+    def __init__(self, cluster_id, comp_prices, params, strategy="static", horizon=HORIZON, action_grid=ACTION_GRID):
         
         self.cluster_id = int(cluster_id)
         self.comp_prices = np.asarray(comp_prices, dtype=float)
+        # Baseline competitor prices as fitted. step() overwrites self.comp_prices
+        # for reactive strategies, so reset() restores this to keep episodes independent.
+        self._comp_prices_base = self.comp_prices.copy()
         self.params = params
         self.horizon = horizon
         self.action_grid = np.asarray(action_grid, dtype=float)
@@ -83,10 +92,16 @@ class MarketEnv:
         self.own_prime = 1.0
         self.own_feedback = params.get("buybox_feedback_median", 4.5)
         self.t = 0
-        self.competitor_strategy = "static"
+        self.competitor_strategy = strategy
+        # Monte Carlo support: when stochastic is True, step() draws realised demand
+        # from a Poisson around the expected value instead of returning the mean. A
+        # single RNG drives both demand noise and stochastic competitor moves, so a
+        # rollout is fully reproducible from its seed (set via reset(seed=...)).
+        self.rng = np.random.default_rng()
+        self.stochastic = False
 
     @classmethod
-    def fit(cls, vn, cluster_id):
+    def fit(cls, vn, cluster_id, strategy="static"):
 
         members = cls._extract_cluster(vn, cluster_id)
 
@@ -102,7 +117,7 @@ class MarketEnv:
         params.update(cls._estimate_seasonality())
         cls._estimate_conversion_rate()
 
-        return cls(int(cluster_id), comp_prices, params)
+        return cls(int(cluster_id), comp_prices, params, strategy=strategy)
 
     @staticmethod
     def _extract_cluster(vn, cluster_id):
@@ -116,29 +131,7 @@ class MarketEnv:
 
 
 
-    #  in order to do this you can add the commaxx products to the vn and then find the cluster such that then you can train a logistic regressor to estimate the demand
-    #  I will estimate using the conversion rate instead of raw orders
-    #
-    #  GLOBAL, category-agnostic CVR model. Trained once over the WHOLE own-catalog
-    #  panel and cached in cls._CVR_MODEL (every cluster's expected_demand reuses it).
-    #  Design forced by the data:
-    #    * The target (units/sessions) and weight (sessions) only exist in
-    #      sales_traffic_daily -- a seller report = own catalog only. Products are
-    #      split across segmentation terms, and any single term has too little price
-    #      movement to fit an elasticity curve, so we POOL across terms and train on
-    #      RELATIVE prices (price / per-category reference). The learned curve is
-    #      "CVR vs how expensive you are relative to typical", which transfers across
-    #      terms without the absolute-price-level mismatch that raw pooling causes.
-    #    * PRICE SOURCE: we drive off sales_traffic_daily (the full panel, ~260k rows)
-    #      and recover the realized price as ordered_product_sales / units_ordered.
-    #      offers_daily.landed_price only covers a few hundred rows, so inner-joining
-    #      it (the old approach) starved training down to ~67 rows. offers_daily is now
-    #      a LEFT JOIN that only supplies supplementary fields where present. On a
-    #      zero-sale day revenue/units is undefined, so we carry the nearest realized
-    #      price within the same asin+marketplace (ffill/bfill) -- the listing price
-    #      moves slowly, so an adjacent day's price is a good stand-in, and this keeps
-    #      the (important) zero-conversion observations in the training set.
-    #  members / comp_prices are accepted for backward-compat but not used.
+   
     _MIN_CVR_SAMPLES = 30
     _MIN_PRICE_LEVELS = 5
 
@@ -150,11 +143,7 @@ class MarketEnv:
 
         try:
             eng = _api_engine()
-            # Base table = sales_traffic_daily (one row per asin/marketplace/day,
-            # verified unique). offers_daily is pre-aggregated to one row per
-            # asin/marketplace/day before the LEFT JOIN so it can only enrich, never
-            # fan out and duplicate traffic rows. product_content is de-duplicated the
-            # same way, for product_type (the per-category price normaliser).
+
             query = text("""
                     SELECT
                     t.asin,
@@ -218,17 +207,13 @@ class MarketEnv:
         sessions = pd.to_numeric(data["sessions"], errors="coerce").fillna(0.0)
         revenue  = pd.to_numeric(data["ordered_product_sales"], errors="coerce").fillna(0.0)
 
-        # Realized price = revenue / units on days that sold; carry the nearest such
-        # price into zero-sale days within the same asin+marketplace, then fall back to
-        # any observed competitive landed price.
+
         data["price"] = revenue / units.where(units > 0)
         data["price"] = (data.groupby(["asin", "marketplace_id"])["price"]
                              .transform(lambda s: s.ffill().bfill()))
         data["price"] = data["price"].fillna(pd.to_numeric(data["landed_price"], errors="coerce"))
 
-        # Per-category (product_type) reference price -> relative price. Fall back to
-        # the global median where a category has no usable price, so the ratio is
-        # always defined; asins that never sold at all sit at ratio 1.0.
+
         global_ref = float(data["price"].median(skipna=True))
         ref = (data.groupby("product_type")["price"].transform("median")
                    .replace(0, np.nan).fillna(global_ref))
@@ -248,9 +233,7 @@ class MarketEnv:
         default_ss = float(np.log(100 + 1) * 4.5)   # matches predict_cvr's fallback
         seller_score = seller_score.fillna(seller_score.median()).fillna(default_ss)
 
-        # Same 7-feature vector as predict_cvr (names/order MUST match). On this panel
-        # min/listing collapse onto price (no competitor prices), which is harmless --
-        # the price->CVR signal now comes from the huge cross-product price variation.
+
         X_df = pd.DataFrame({
             'price_ratio': data["price"] / ref,
             'min_price_ratio': data["price"] / ref,
@@ -260,18 +243,14 @@ class MarketEnv:
             'prime_availability': prime,
             'seller_score': seller_score,
         })
-        # Target CVR as a FRACTION (units/sessions). Clip the rare >100% (multi-unit
-        # orders / data artifacts) into [0, 1] to match predict_cvr's output range.
+        
         y = np.clip((units / sessions.where(sessions > 0)).to_numpy(dtype=float), 0.0, 1.0)
         weights = sessions.to_numpy(dtype=float)
 
-        # Drop rows with an unusable target/weight before fitting.
         good = np.isfinite(y) & np.isfinite(weights) & (weights > 0)
         X_df, y, weights = X_df[good].reset_index(drop=True), y[good], weights[good]
 
-        # Degeneracy guards: a booster fit on too few samples, or on prices that never
-        # move, learns nothing about price response. Fall back loudly to the constant-
-        # CVR path (expected_demand uses 0.03) instead of shipping a garbage curve.
+      
         n_prices = X_df['price_ratio'].round(2).nunique() if not X_df.empty else 0
         if len(X_df) < cls._MIN_CVR_SAMPLES:
             print(f"[_estimate_conversion_rate] only {len(X_df)} usable rows "
@@ -288,7 +267,6 @@ class MarketEnv:
               f"{data['product_type'].nunique()} product types, {n_prices} distinct price_ratio levels "
               f"(weighted mean CVR = {np.average(y, weights=weights):.4f})")
 
-        # Fit a non-linear gradient booster using traffic volume as weights
         cls._CVR_MODEL = HistGradientBoostingRegressor(random_state=1, max_iter=200)
         cls._CVR_MODEL.fit(X_df, y, sample_weight=weights)
 
@@ -343,6 +321,9 @@ class MarketEnv:
 
         model = LogisticRegression(max_iter=1000)
         model.fit(X, y)
+        # Keep the fitted estimator so _buybox_prob can call predict_proba directly
+        # instead of re-implementing the logistic from extracted coefficients.
+        cls._BUYBOX_MODEL = model
         b = model.coef_[0]
         cls._BUYBOX = {
             "buybox_intercept": float(model.intercept_[0]),
@@ -408,13 +389,19 @@ class MarketEnv:
 
 
     # ---- RL interface --------------------------------------------------
-    def reset(self, target_product, start_week=None, competitor_strategy="static"):
+    def reset(self, target_product, start_week=None, competitor_strategy="promo_cycler", seed=None):
         row = target_product.iloc[0]
         self.target = target_product
         raw = float(pd.to_numeric(pd.Series([row[PRICE_COL]]), errors="coerce").iloc[0])
         self.own_price = raw * self.params["price_scale"] + self.params["price_center"]
         self.own_quality = self._quality(row)
         self.t = 0
+        # Reseed for a reproducible Monte Carlo rollout when a seed is given.
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        # Restore the fitted competitor baseline so reactive strategies start each
+        # episode from the same prices instead of inheriting the previous episode's.
+        self.comp_prices = self._comp_prices_base.copy()
         self.competitor_strategy = competitor_strategy
         if start_week is None:
             start_week = pd.Timestamp.today().isocalendar().week
@@ -427,6 +414,10 @@ class MarketEnv:
         self.own_price = self.own_price * self.action_grid[int(action)]
         self.comp_prices = self._competitor_prices(self.competitor_strategy)
         units = self.expected_demand(self.own_price)
+        if self.stochastic:
+            # Sample realised demand around the expected value so repeated rollouts
+            # form a distribution (Monte Carlo). Poisson is the natural count model.
+            units = float(self.rng.poisson(max(units, 0.0)))
         reward = self._profit(self.own_price, units)
         self.last_units = float(units)
         self.iso_week = ((self.start_week - 1 + self.t) % 52) + 1
@@ -445,18 +436,7 @@ class MarketEnv:
             season,
         ], dtype=float)
 
-    # ---- the three brains ---------------------------------------------
-    def _logit_demand(self, own_price):
-        a = self.params["alpha"]
-        u0 = self.params["outside_utility"]
-        comp_ref = self._competitor_reference()
-        u_own = self.own_quality - a * own_price
-        u_comp = -a * comp_ref
-        n_comp = max(len(self.comp_prices), 1)
-        num = np.exp(u_own)
-        den = np.exp(u0) + num + n_comp * np.exp(u_comp)
-        market_share = num / den
-        return market_share * self.params["market_size"] * self._seasonal_multiplier(self.t)
+
 
     def _seasonal_multiplier(self, t):
         week = ((self.start_week - 1 + t) % 52) + 1
@@ -464,6 +444,17 @@ class MarketEnv:
 
     def _buybox_prob(self, own_price, comp_ref):
         gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0
+
+        # Use the fitted LogisticRegression directly when one was trained. Feature
+        # order must match _estimate_buybox's training matrix exactly:
+        # [gap, fba, prime, feed]. This also means swapping in a non-linear buy-box
+        # classifier later requires no change here -- predict_proba handles it.
+        if self._BUYBOX_MODEL is not None:
+            X = np.array([[gap, self.own_fba, self.own_prime, self.own_feedback]], dtype=float)
+            return float(self._BUYBOX_MODEL.predict_proba(X)[0, 1])
+
+        # No model fit (DB unavailable / too little data): fall back to the stored
+        # coefficients -- either those extracted from a past fit or the defaults.
         z = (self.params["buybox_intercept"]
              + self.params["buybox_gap_coef"] * gap
              + self.params["buybox_fba_coef"] * self.own_fba
@@ -499,7 +490,9 @@ class MarketEnv:
                 raise NotImplementedError(f"competitor strategy '{strategy_type}' is not implemented yet")
 
             case "promo_cycler":
-                rng = np.random.default_rng(seed=int(self.t))
+                # Use the env RNG (seeded per rollout) instead of a t-seeded local RNG,
+                # so promo draws actually vary across Monte Carlo rollouts.
+                rng = self.rng
 
                 is_promo_week = (self.t % 10) in [0, 1]
 
@@ -571,9 +564,10 @@ class MarketEnv:
         blob = {
             "cluster_id": self.cluster_id,
             "params": self.params,
-            "comp_prices": self.comp_prices.tolist(),
+            "comp_prices": self._comp_prices_base.tolist(),
             "horizon": self.horizon,
             "action_grid": self.action_grid.tolist(),
+            "strategy": self.competitor_strategy,
         }
         Path(path).write_text(json.dumps(blob, indent=2))
         return path
@@ -582,5 +576,6 @@ class MarketEnv:
     def load(cls, path):
         blob = json.loads(Path(path).read_text())
         return cls(blob["cluster_id"], np.asarray(blob["comp_prices"], dtype=float),
-                   blob["params"], horizon=blob.get("horizon", HORIZON),
+                   blob["params"], strategy=blob.get("strategy", "static"),
+                   horizon=blob.get("horizon", HORIZON),
                    action_grid=blob.get("action_grid", ACTION_GRID))

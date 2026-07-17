@@ -28,6 +28,13 @@ def build_vn(search_term="Headphones", k=1, resolution=1.0):
     return vn, data
 
 
+
+def pick_specific_target(data, asin, asin_col=("clean", "asin")):
+    match = data.loc[data[asin_col] == asin]
+    if match.empty:
+        raise ValueError(f"asin {asin!r} not found in data")
+    return match.iloc[[0]]
+
 def pick_target(data, random_state=2):
     unique = data.drop_duplicates(subset=[ASIN_COL])
     rng = np.random.default_rng(random_state)
@@ -43,13 +50,13 @@ def main():
     
     print("getting target ")
     target = pick_target(data)
-
+    # target = pick_specific_target(data  ,'B0DCVKJGLX')
     asin_col = ("clean", "asin")
     target_asin = target[asin_col].iloc[0] if asin_col in target.columns else None
     print("target ASIN:", target_asin if pd.notna(target_asin) else "unresolved")
 
     print("target : " , target )
-    game = pricing_game(target, vn)
+    game = pricing_game(target, vn, competitor_strategy="promo_cycler")
 
     print("target cluster:", game.cluster_id)
 
@@ -60,17 +67,19 @@ def main():
     assessment = game.assess()
 
 
-    print("--- REVEALING THE BLACK BOX ---")
-    print(f"Starting Price: ${assessment['start_price']:.2f}")
-    print(f"Final Price Recommended: ${assessment['final_price']:.2f}")
-    print(f"Total Predicted Units (52 wks): {assessment['total_units']:.0f}")
+    print("\n--- MONTE CARLO (n=500) ---")
+    mc = game.monte_carlo(n=500, randomize_week=False)
+    pr, un = mc["profit"], mc["units"]
+    print(f"Season profit: mean=${pr['mean']:,.0f}  "
+          f"90% band [${pr['p05']:,.0f}, ${pr['p95']:,.0f}]  (std ${pr['std']:,.0f})")
+    print(f"Season units:  mean={un['mean']:,.0f}  "
+          f"90% band [{un['p05']:,.0f}, {un['p95']:,.0f}]")
 
-    # Print the week-by-week price + predicted demand evolution
-    print("\nWeek-by-Week Schedule (ISO week | price | predicted units):")
-    for iso_week, price, units in zip(
-        assessment['weeks'], assessment['schedule'], assessment['demand']
-    ):
-        print(f"  W{iso_week:02d}: ${price:6.2f}   {units:7.1f} units")
+    tag = str(target_asin) if pd.notna(target_asin) else f"cluster{game.cluster_id}"
+    for metric in ("demand", "profit", "price"):
+        out = os.path.join(HERE, f"mc_band_{metric}_{tag}.png")
+        game.plot_bands(mc, metric=metric, path=out)
+        print(f"  saved {metric} band -> {out}")
 
 if __name__ == "__main__":
     main()
