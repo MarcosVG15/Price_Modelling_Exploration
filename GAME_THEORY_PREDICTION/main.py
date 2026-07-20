@@ -56,13 +56,16 @@ def main():
     print("target ASIN:", target_asin if pd.notna(target_asin) else "unresolved")
 
     print("target : " , target )
-    game = pricing_game(target, vn, competitor_strategy="promo_cycler")
+    game = pricing_game(target, vn, competitor_strategy="RL")
 
     print("target cluster:", game.cluster_id)
 
     game.test()
 
-    game.train(episodes=2000)
+    history = game.train(episodes=2000)
+    cr_path = game.plot_cumulative_reward()
+    print(f"  saved cumulative reward -> {cr_path}")
+
     # Run the assessment after training
     assessment = game.assess()
 

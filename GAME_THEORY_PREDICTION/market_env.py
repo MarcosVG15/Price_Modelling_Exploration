@@ -99,6 +99,14 @@ class MarketEnv:
         # rollout is fully reproducible from its seed (set via reset(seed=...)).
         self.rng = np.random.default_rng()
         self.stochastic = False
+        # --- 2-player self-play ---------------------------------------------
+        # An optional RL competitor (any Agent) that sets its OWN price via the
+        # "RL" strategy and learns inside step(). Attached by pricing_game.
+        self.competitor_agent = None
+        self.competitor_learning = True   # gate learning/exploration off during greedy eval
+        self.comp_price = None            # the RL competitor's single scalar price
+        self.comp_cost = None
+        self._comp_pending = None         # (state, action) the competitor just took, for observe()
 
     @classmethod
     def fit(cls, vn, cluster_id, strategy="static"):
@@ -408,10 +416,16 @@ class MarketEnv:
         self.start_week = int(start_week)
         if self.params.get("cost") is None:
             self.params["cost"] = 0.6 * self.own_price
+        # RL competitor starts each episode at the cluster's typical price.
+        self.comp_price = float(self.params["reference_price"])
+        self.comp_cost = 0.6 * self.comp_price
+        self._comp_pending = None
         return self._state()
 
     def step(self, action):
         self.own_price = self.own_price * self.action_grid[int(action)]
+        # Competitor moves. For the "RL" strategy this queries self.competitor_agent
+        # (see _competitor_prices) and records (state, action) in self._comp_pending.
         self.comp_prices = self._competitor_prices(self.competitor_strategy)
         units = self.expected_demand(self.own_price)
         if self.stochastic:
@@ -423,7 +437,19 @@ class MarketEnv:
         self.iso_week = ((self.start_week - 1 + self.t) % 52) + 1
         self.t += 1
         done = self.t >= self.horizon
-        return self._state(), reward, done
+        next_state = self._state()
+
+        # The RL competitor learns from its OWN transition, encapsulated here so the
+        # agent-facing step() signature stays single-player. Skipped when learning is
+        # gated off (e.g. greedy eval), which freezes the opponent.
+        if self.competitor_learning and self._comp_pending is not None:
+            s_c, a_c = self._comp_pending
+            comp_reward = self._competitor_profit(self._competitor_reference())
+            self.competitor_agent.observe(s_c, a_c, comp_reward, self._competitor_state(), done)
+            if done:
+                self.competitor_agent.on_episode_end()
+            self._comp_pending = None
+        return next_state, reward, done
 
     def _state(self):
         ref = self.params["reference_price"]
@@ -482,12 +508,18 @@ class MarketEnv:
                 floor = self.params.get("comp_floor_price", self.params["reference_price"] * 0.7)
                 return np.maximum(self.own_price, floor)
 
-            case "tit_for_tat" | "SL" | "RL":
-                # Stubbed out -- fail loudly rather than silently returning None,
-                # which would otherwise propagate into comp_prices and crash later
-                # (e.g. in _competitor_reference) with a confusing error far from
-                # the actual cause.
-                raise NotImplementedError(f"competitor strategy '{strategy_type}' is not implemented yet")
+            case "RL":
+                # The competitor is an RL Agent maximising its OWN profit -> a 2-player
+                # game. It observes a mirrored state, picks a multiplier off the same
+                # action grid, and (in step()) learns from its own reward.
+                if self.competitor_agent is None:
+                    print("NO COMPETITOR CHOSEN")
+                    return base_prices           # no agent attached yet -> behave like static
+                s_c = self._competitor_state()
+                a = int(self.competitor_agent.choose(s_c, explore=self.competitor_learning))
+                self._comp_pending = (s_c, a)    # remember for observe() in step()
+                self.comp_price = float(max(self.comp_price * self.action_grid[a], floor))
+                return np.array([self.comp_price])
 
             case "promo_cycler":
                 # Use the env RNG (seeded per rollout) instead of a t-seeded local RNG,
@@ -542,22 +574,46 @@ class MarketEnv:
 
         return float(np.clip(self._CVR_MODEL.predict(X_df)[0], 0.0, 1.0))
 
+    def _sessions(self):
+        # Traffic available this week: market size scaled by seasonality. Shared by
+        # our demand and the competitor's so the two stay on the same scale.
+        return self.params.get("market_size", 1000) * self._seasonal_multiplier(self.t)
+
     def expected_demand(self, own_price):
         comp_ref = self._competitor_reference()
         bb_prob = self._buybox_prob(own_price, comp_ref)
         cvr = self.predict_cvr(own_price, comp_ref)
 
-        market_size = self.params.get("market_size", 1000)
-        sessions = market_size * self._seasonal_multiplier(self.t)
-
         # Expected demand is the combination of visibility, intent, and traffic
-        return sessions * bb_prob * cvr
+        return self._sessions() * bb_prob * cvr
 
     def _profit(self, own_price, units):
         return (own_price - self.params["cost"]) * units
 
     def _competitor_reference(self):
         return float(self.comp_prices.min()) if self.comp_prices.size else self.params["reference_price"]
+
+    # ---- 2-player: the RL competitor's state & payoff ------------------
+    def _competitor_state(self):
+        """The competitor's view of the market -- the mirror image of _state():
+        its own price, OUR price, its buy-box share, and season."""
+        ref = self.params["reference_price"]
+        comp_p = self._competitor_reference()
+        season = min(self._seasonal_multiplier(self.t) / 3.0, 1.0)
+        return np.array([
+            comp_p / ref if ref else 0.0,
+            self.own_price / ref if ref else 0.0,
+            1.0 - self._buybox_prob(self.own_price, comp_p),   # competitor wins what we don't
+            season,
+        ], dtype=float)
+
+    def _competitor_profit(self, comp_price):
+        """Competitor's per-step profit. The buy-box splits the market: it wins the
+        (1 - our_buybox) share of sessions. CVR reuses our model with the competitor's
+        price (seller-side features are approximated as symmetric)."""
+        bb_us = self._buybox_prob(self.own_price, comp_price)
+        comp_units = self._sessions() * (1.0 - bb_us) * self.predict_cvr(comp_price, comp_ref=self.own_price)
+        return (comp_price - self.comp_cost) * comp_units
 
     # ---- persistence ---------------------------------------------------
     def save(self, path):

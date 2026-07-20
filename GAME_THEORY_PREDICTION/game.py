@@ -9,20 +9,8 @@ import torch
 import torch.nn as nn
 import random
 from collections import deque
+from agents import TQL , DQN , PPO 
 
-class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(QNetwork, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, action_dim)
-        )
-        
-    def forward(self, x):
-        return self.fc(x)
 
 class pricing_game:
     def __init__(self, target_product, vn, k=1, bins=12, seed=0, competitor_strategy="static"):
@@ -42,6 +30,9 @@ class pricing_game:
         self.low = np.array([0.0, 0.0, 0.0, 0.0])
         self.high = np.array([2.0, 2.0, 1.0, 1.0])
         self.history = []
+        # 2-player game: when the competitor strategy is "RL", attach a learning
+        # opponent (its own Agent) to the env. It maximises its own profit in step().
+        self.env.competitor_agent = self.choose_agent("PPO") if competitor_strategy == "RL" else None
 
 
     def test(self):
@@ -53,78 +44,149 @@ class pricing_game:
         print(f"CVR model status: {status}")
 
 
-    def _key(self, state):
-        s = np.clip((np.asarray(state) - self.low) / (self.high - self.low), 0.0, 1.0)
-        idx = np.minimum((s * self.bins).astype(int), self.bins - 1)
-        return tuple(int(i) for i in idx)
 
-    def _q(self, key):
-        if key not in self.q_table:
-            self.q_table[key] = np.zeros(self.env.action_dim)
-        return self.q_table[key]
-
-    def choose(self, state, epsilon):
-        if self.rng.random() < epsilon:
-            return int(self.rng.integers(self.env.action_dim))
-        return int(np.argmax(self._q(self._key(state))))
-    
-
-    def agentic_model(self , type, state, total , epsilon, gamma , alpha):
-
+    def choose_agent(self , type):
+        
         match type :
-            case 'TQL' : 
-                a = self.choose(state, epsilon)
-                nxt, r, done = self.env.step(a)
-                q = self._q(self._key(state))
-                target = r if done else r + gamma * float(np.max(self._q(self._key(nxt))))
-                q[a] += alpha * (target - q[a])
-                state = nxt
-                total += r
+            case 'TQL' :
+                tql_agent = TQL(action_dim=self.env.action_dim, low=self.low, high=self.high)
+                return tql_agent
+            
+            case 'DQN' :
+                dqn_agent = DQN(state_dim=self.env.state_dim, action_dim=self.env.action_dim)
+                return dqn_agent
 
-                return done, total , state
+            case 'PPO' :
+                ppo_agent = PPO(state_dim=self.env.state_dim, action_dim=self.env.action_dim)
+                return ppo_agent
+            
+            # case 'A2C': 
 
-            case 'DQN' : 
-                pass
+            # case 'SAC':
+
+            # case 'MVN' marcos special. 
+
+            case _ :
+                print("AGENT NOT FOUND HABIBI")
+                return None
 
 
-        return None
-
-
-
-
-
-
-    def train(self, episodes=3000, alpha=0.1, gamma=0.95,  epsilon=1.0, epsilon_min=0.05, decay=0.999 , type = 'TQL'):
+    def train(self, episodes=3000, alpha=0.1, gamma=0.95,  epsilon=1.0, epsilon_min=0.05, decay=0.999,
+              type='PPO', eval_every=50, eval_week=1, eval_seed=0):
         self.history = []
+        self.eval_history = []       # (episode, greedy_return) -- clean policy-quality checkpoints
+        # Remember the run's key params so plot_cumulative_reward() can name the file.
+        self.train_config = {"agent": type, "episodes": episodes,
+                             "gamma": gamma, "epsilon": epsilon, "decay": decay}
         pbar = tqdm(range(episodes), desc=f"training {type}", unit="ep")
-       
-       
-        for _ in pbar:
+        self.agent = self.choose_agent(type)
+
+        for i in pbar:
             start_week = int(self.rng.integers(1, 53))
             state = self.env.reset(self.target, start_week=start_week, competitor_strategy=self.competitor_strategy)
             done = False
             total = 0.0
             while not done:
-                a = self.choose(state, epsilon)
+                a = self.agent.choose(state)
                 nxt, r, done = self.env.step(a)
-                q = self._q(self._key(state))
-                target = r if done else r + gamma * float(np.max(self._q(self._key(nxt))))
-                q[a] += alpha * (target - q[a])
+                self.agent.observe(state , a , r , nxt , done)
                 state = nxt
                 total += r
 
-            epsilon = max(epsilon_min, epsilon * decay)
+            self.agent.on_episode_end()                  # anneal exploration (TQL/DQN ε; no-op for PPO)
             self.history.append(total)
-            pbar.set_postfix(avg_reward=f"{np.mean(self.history[-50:]):.1f}", eps=f"{epsilon:.3f}")
+
+            # Periodic GREEDY eval: roll out the CURRENT policy with NO exploration on a
+            # FIXED week/seed, so the only thing changing between checkpoints is the policy
+            # itself. best_policy() never calls observe(), so it can't perturb learning.
+            if (i + 1) % eval_every == 0:
+                rng_state = self.env.rng                 # keep the training RNG stream intact ...
+                greedy = self.best_policy(start_week=eval_week, seed=eval_seed)
+                self.env.rng = rng_state                 # ... (the eval ran on its own seeded stream)
+                self.eval_history.append((i + 1, greedy["total_profit"]))
+
+            postfix = {"avg_reward": f"{np.mean(self.history[-50:]):.1f}"}
+            if self.eval_history:
+                postfix["greedy"] = f"{self.eval_history[-1][1]:.0f}"
+            eps = getattr(self.agent, "epsilon", None)   # PPO has no ε -> omit it from the bar
+            if eps is not None:
+                postfix["eps"] = f"{eps:.3f}"
+            pbar.set_postfix(**postfix)
         return self.history
 
+    def _cumreward_path(self):
+        """Descriptive PNG path under cumulative_reward/, built from the last
+        train() config + competitor/cluster. Same params -> same file (overwrite)."""
+        import os
+        cfg = getattr(self, "train_config", {})
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cumulative_reward")
+        os.makedirs(out_dir, exist_ok=True)
+        name = "_".join([
+            "cumreward",
+            str(cfg.get("agent", "NA")),                 # the agent used
+            f"ep{cfg.get('episodes', 'NA')}",            # key params ...
+            str(self.competitor_strategy),
+            f"cluster{self.cluster_id}",
+        ]) + ".png"
+        return os.path.join(out_dir, name)
+
+    def plot_cumulative_reward(self, path=None, window=50, ax=None):
+        """Plot the learning curve from ``self.history``: the raw per-episode
+        cumulative reward (season profit) plus a moving-average trend. Saves a PNG
+        under ``cumulative_reward/`` named by the agent + key params, unless ``path``
+        is given. Run ``train()`` first.
+        """
+        import matplotlib
+        if ax is None:
+            matplotlib.use("Agg")          # headless-safe when saving to file
+        import matplotlib.pyplot as plt
+
+        if not self.history:
+            raise RuntimeError("no training history -- call train() first")
+
+        hist = np.asarray(self.history, dtype=float)
+        x = np.arange(1, len(hist) + 1)
+
+        created = ax is None
+        if created:
+            _, ax = plt.subplots(figsize=(11, 5))
+        ax.plot(x, hist, lw=0.8, alpha=0.30, label="episode return (training, exploring)")
+        if len(hist) >= window:            # smoothed trend (raw curve is noisy)
+            ma = np.convolve(hist, np.ones(window) / window, mode="valid")
+            ax.plot(np.arange(window, len(hist) + 1), ma, lw=2.0,
+                    label=f"{window}-ep moving average")
+
+        ev = getattr(self, "eval_history", [])
+        if ev:                             # clean policy-quality signal: greedy, fixed week
+            ex, ey = zip(*ev)
+            ax.plot(ex, ey, lw=2.0, color="green", marker="o", ms=3,
+                    label="greedy eval (fixed week, no exploration)")
+
+        cfg = getattr(self, "train_config", {})
+        ax.set_xlabel("episode")
+        ax.set_ylabel("cumulative reward (season profit)")
+        ax.set_title(f"Cumulative reward — {cfg.get('agent', '?')} "
+                     f"vs '{self.competitor_strategy}' (cluster {self.cluster_id})")
+        ax.legend(loc="best", fontsize=8)
+
+        if not created:
+            return ax
+        ax.figure.tight_layout()
+        if path is None:
+            path = self._cumreward_path()
+        ax.figure.savefig(path, dpi=120)
+        plt.close(ax.figure)
+        return path
+
     def best_policy(self, start_week=None, seed=None):
+        if getattr(self, "agent", None) is None:
+            raise RuntimeError("no trained agent -- call train() before best_policy()")
         state = self.env.reset(self.target, start_week=start_week, seed=seed,
                                competitor_strategy=self.competitor_strategy)
         done = False
         prices, multipliers, rewards, buybox, demand, weeks = [], [], [], [], [], []
         while not done:
-            a = int(np.argmax(self._q(self._key(state))))
+            a = self.agent.choose(state, explore=False)   # greedy: use the trained policy
             state, r, done = self.env.step(a)
             prices.append(self.env.own_price)
             multipliers.append(float(self.env.action_grid[a]))
@@ -172,24 +234,7 @@ class pricing_game:
         }
 
     def monte_carlo(self, n=500, seed0=0, stochastic=True, randomize_week=True):
-        """Monte Carlo the current greedy policy against the current competitor.
-
-        Runs ``n`` independent rollouts, each reseeded (so demand noise and stochastic
-        competitor moves vary) and optionally started on a random ISO week.
-
-        Returns season-total distributions (profit / units / final price) AND per-week
-        confidence bands over the horizon: for every prediction week it reports the mean
-        and the 5/25/50/75/95th percentiles across rollouts, so the trajectory can be
-        drawn as a fan chart (see ``plot_bands``).
-
-        On ``randomize_week``: leave it True for a scenario band (robust across seasons).
-        Set it False for a *clean seasonal forecast* band -- then every rollout forecasts
-        the same calendar weeks, so the band reflects only demand/competitor noise and the
-        ISO week of each prediction step is returned too.
-
-        Requires a trained policy (call ``train()`` first) and, for real variance,
-        ``stochastic=True`` so ``step()`` samples demand instead of using the mean.
-        """
+        
         wk_rng = np.random.default_rng(seed0)   # dedicated stream -> reproducible from seed0
         self.env.stochastic = stochastic
         totals = {"profit": [], "units": [], "final_price": []}
