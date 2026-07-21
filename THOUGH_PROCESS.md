@@ -44,4 +44,52 @@ we can do several run , we can fine tune and I am sure that we could get decentl
 
 - I will be taking a game theoretic approach. 
 
+### 20/07/26 
 
+
+I created the game a while ago , it was very hard to understand but right now I have 
+
+- conversion rate computated accross all of the products ( more on this later)
+- buybox percent - perhaps I should also only consider top performing products 
+
+
+I developed 3 agents TQ: DQN and PPO - these are then trained againts static or dynamic agents 
+
+The dynamic gave many issues so I decided to see if pretraining with a static model would yield better results - it did but still doesnt behave how I would like it to 
+
+next step would be to train on real top performing producst before doing the reinforcement step with itself 
+I need to also see the effects of the new scraped data of our commaxx products through the scraper such that I can see whether the relavance did in fact increase. 
+
+
+
+
+I asked ai to change the query such thqt it only extract top performing products since a lot of them the company doesnt maintain
+
+
+### 21/07/26 
+
+I think that i can improve the prediction of the demand based on the predicted unit as probabilistic thresholds instead of raw counts - Negative Binomial distribution 
+
+
+I am starting to realize that the task of prediciting the reward might be harder than what I thought , maybe instead of simulating , I could just find the closest ten products to it and weighted average those properties - f w would like to analyze the headphones then you will find the products who are most similar to it and weigh its impact on the final price / output 
+
+
+
+
+I am at a road block because the demand prediction section is not working properly so I need to find a way to make the system predict demand more accurately 
+
+https://www.dii.uchile.cl/wp-content/uploads/2014/06/Modeling+Pricing+Strategies+Using+Game+Theory+and+Support+Vector+Machines.pdf
+
+I found this article by gods grace Imma read it and then see what happens
+
+
+what I realized is that the core issue that I have is the profit model , I do not have a solid reward system that will allow for good agent v agent training 
+
+  units = self.expected_demand(self.own_price)
+        if self.stochastic:
+            units = self._draw_demand(units)   # Negative Binomial (mean-preserving, overdispersed)
+        reward = self._profit(self.own_price, units)
+
+
+
+    the thing is that the reward comes from the units sold which then I guess is a poor demand prediction model even though the plots dont look unreasonable

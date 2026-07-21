@@ -56,7 +56,7 @@ def main():
     print("target ASIN:", target_asin if pd.notna(target_asin) else "unresolved")
 
     print("target : " , target )
-    game = pricing_game(target, vn, competitor_strategy="RL")
+    game = pricing_game(target, vn, competitor_strategy="promo_cycler")
 
     print("target cluster:", game.cluster_id)
 
