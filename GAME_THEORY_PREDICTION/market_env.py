@@ -60,9 +60,31 @@ class MarketEnv:
 
     _CACHE = {}
     _BUYBOX_SHAP_MODEL = None
-    _CVR_SHAP_MODEL  = None 
+    _CVR_SHAP_MODEL  = None
     _BUYBOX_MODEL = None
     _CVR_MODEL = None
+
+    # Trained CVR schema, captured in fit_cvr(): the exact ordered feature list the
+    # SHAP pass selected and the subset that must be `category` dtype at predict time.
+    # predict_cvr rebuilds its input row against these -- never hardcode column names.
+    _CVR_FEATURES = None
+    _CVR_CAT_COLS = None
+    _CVR_CAT_LEVELS = None        # {cat_col: fitted categories} -> align predict-time codes
+    _CVR_PANEL_DF = None          # cached CVR panel (avoids re-reading the CSV per reset)
+
+    # Trained BUY-BOX schema, captured in fit_buybox() -- same contract as the CVR
+    # trio. The panel model has NO competitor-price feature (that data was too sparse),
+    # so _buybox_prob modulates its output by the price gap vs the cluster peers.
+    _BUYBOX_FEATURES = None
+    _BUYBOX_CAT_COLS = None
+    _BUYBOX_CAT_LEVELS = None
+    _BUYBOX_PANEL_DF = None        # cached buy-box panel
+
+    # Features overwritten at predict time by the pricing action / clock. Everything
+    # else in the trained schema is a static product attribute taken from the snapshot.
+    _CVR_DYNAMIC = {"price", "price_vs_lowest", "lowest_price", "bb_price",
+                    "listing_price", "raw_price", "implied_price",
+                    "week_of_year", "month"}
 
 
 
@@ -93,6 +115,8 @@ class MarketEnv:
         self.action_dim = len(self.action_grid)
         self.state_dim = 4
         self.target = None
+        self._cvr_feat_snapshot = None    # set by bind_target_features()/reset()
+        self._buybox_feat_snapshot = None # set by bind_target_features()/reset()
         self.own_price = None
         self.own_quality = 0.0
         self.own_fba = 1.0
@@ -140,13 +164,6 @@ class MarketEnv:
         # params.update(cls._estimate_seasonality())
         # cls._estimate_conversion_rate()
 
-
-
-        # --- calibrate Negative-Binomial dispersion from real weekly demand --------
-        # Extract this cluster's own units sold, aggregate to (asin, marketplace, week)
-        # totals, and estimate r by method of moments: r = mean^2 / (var - mean).
-        # Falls back to a near-Poisson r if the query fails / data is too thin / the
-        # series isn't overdispersed.
         nb_dispersion = 1.0
         try:
             asins = members[("clean", "asin")].dropna().astype(str).unique().tolist()
@@ -242,141 +259,21 @@ class MarketEnv:
         cls._CVR_SHAP_MODEL = {'model': model , 'features': X}            
 
 
-    @classmethod
-    def extract_feature_importance_BBox(cls):
-               
-        if not os.path.exists(BBOX_path):
-            raise FileNotFoundError(
-                f"buy-box feature panel not found: {BBOX_path}\n"
-                f"Run `python GAME_THEORY_PREDICTION/BBOX/build_feature_panel_BBox.py` first.")
-        shap_data = pd.read_csv(BBOX_path)
-
-        # drop identifiers, the target, demand OUTCOMES, and the duplicate raw
-        # price sources (keep the coalesced+ffilled `price`).
-        drop_columns = [
-            "asin", "marketplace_id", "week", "buybox_pct",
-            "units", "sessions", "revenue",
-            "implied_price", "oi_price", "listing_price", "raw_price",
-            "rank_value", "main_browser_node_id",
-        ]
-
-        Y = (shap_data["buybox_pct"] / 100.0).clip(0.0, 1.0)   # buy-box share in [0, 1]
-        X = shap_data.drop(columns=[c for c in drop_columns if c in shap_data.columns])
-
-        # near-empty numeric cols (the ~2-week competition/stock snapshots over a
-        # 2-yr panel) break HistGBR's binning -> drop anything under 2% coverage.
-        sparse = [c for c in X.columns if X[c].notna().mean() < 0.02]
-        X = X.drop(columns=sparse)
-
-        # one-hot the low-card string/bool categoricals so SHAP never sees a str.
-        cat_cols = [c for c in ["brand", "product_type", "manufacturer", "has_aplus"]
-                    if c in X.columns]
-        X = pd.get_dummies(X, columns=cat_cols, drop_first=True).astype(float)
-        print(f"[shap-bbox] {X.shape[1]} features; dropped {len(sparse)} near-empty cols: {sparse}")
-
-        X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.3, random_state=0)
-
-        model = HistGradientBoostingRegressor(max_iter=200, random_state=0)
-        model.fit(X_train, Y_train)
-        cls._BUYBOX_SHAP_MODEL = {'model': model , 'features': X}            
     
-
-    ''' Using a similar approach to make a prediction model for the buybox'''
-    @classmethod
-    def predict_buybox(cls, top_k=15):
- 
-        if cls._BUYBOX_SHAP_MODEL is None:
-            cls.extract_feature_importance_BBox()
-
-        if cls._BUYBOX_MODEL is not None:
-            return cls._BUYBOX_MODEL
-
-        model = cls._BUYBOX_SHAP_MODEL["model"]
-        feats = cls._BUYBOX_SHAP_MODEL["features"]        
-
-        shap_vals = shap.TreeExplainer(model).shap_values(feats.iloc[:2000])
-        importance = (pd.Series(abs(shap_vals).mean(axis=0), index=feats.columns)
-                        .sort_values(ascending=False))
-        
-        feature_names = importance.index.tolist()
-        top_features = feature_names[:top_k]
-
-        bbox_data = pd.read_csv(BBOX_path)
-
-        drop_columns = [] 
-        for column in bbox_data.columns:
-            if column not in feature_names:
-                drop_columns.append(column)
-
-        Y = (bbox_data["buybox_pct"] / 100.0).clip(0.0, 1.0)
-        X = bbox_data.drop(columns=[c for c in drop_columns if c in bbox_data.columns])
-
-
-        raw_columns_to_keep = []
-        for feature in top_features:
-            matched = False
-            for parent_col in ["brand", "product_type", "manufacturer", "has_aplus"]:
-                if feature.startswith(parent_col):
-                    raw_columns_to_keep.append(parent_col)
-                    matched = True
-                    break
-            if not matched:
-                raw_columns_to_keep.append(feature)
-        
-        raw_columns_to_keep = list(set(raw_columns_to_keep))
-
-        X = X[[c for c in raw_columns_to_keep if c in X.columns]]
-
-        for col in ["brand", "product_type", "manufacturer"]:
-            if col in X.columns:
-                X[col] = X[col].astype('category')
-
-        X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.4, random_state=0)
-        categorical_mask = [
-            True if col in ["brand", "product_type", "manufacturer"] else False
-            for col in X_train.columns
-        ]
-
-
-        # tuned by ai 
-        best_tuned = HistGradientBoostingRegressor(
-            max_iter=200,             # Build more trees
-            learning_rate=0.08,       # Increase learning rate slightly (default is 0.1)
-            max_leaf_nodes=31,        # Allow larger, more complex trees (default is 31)
-            min_samples_leaf=10,      # LOWER THIS: Allows splits on smaller brands (e.g., 10 rows)
-            l2_regularization=0.5,    # Lower regularization to let the model fit the categories better
-            categorical_features=categorical_mask,
-            random_state=0,
-        ) 
-        best_tuned.fit(X_train, Y_train)
-        cls._BUYBOX_MODEL = best_tuned
-
-        return X_test, Y_test  , cls._BUYBOX_MODEL
-
-
     @classmethod
     def fit_cvr(cls, top_k=15):
-        """Rank CVR features by SHAP, then refit a tuned HistGBR on the top-k
-        (parent) features using NATIVE categoricals. Returns (X_test, Y_test, model).
 
-        NB: renamed from predict_cvr to avoid colliding with the instance-level
-        predict_cvr(self, own_price, ...) inference method further down the class.
-        """
-        # 1. SHAP model (lazy-train once)
         if cls._CVR_SHAP_MODEL is None:
             cls.extract_feature_importance_CVR()
         model = cls._CVR_SHAP_MODEL["model"]
-        feats = cls._CVR_SHAP_MODEL["features"]          # one-hot training matrix (DataFrame)
+        feats = cls._CVR_SHAP_MODEL["features"]          
 
-        # 2. SHAP -> mean|impact| per one-hot column -> ranked names -> top-k
         shap_vals = shap.TreeExplainer(model).shap_values(feats.iloc[:2000])
         importance = (pd.Series(abs(shap_vals).mean(axis=0), index=feats.columns)
                         .sort_values(ascending=False))
         top_features = importance.index.tolist()[:top_k]
 
-        # 3. map one-hot names back to RAW panel columns. A dummy like
-        #    "product_type_Speaker" -> keep the whole raw "product_type" column;
-        #    a plain numeric column keeps its own name.
+
         cats = ["brand", "product_type", "manufacturer", "has_aplus"]
         raw_keep = []
         for f in top_features:
@@ -385,8 +282,6 @@ class MarketEnv:
         raw_keep = list(dict.fromkeys(raw_keep))         # dedupe, preserve order
         print(f"[cvr] top {top_k} one-hot features -> {len(raw_keep)} raw cols: {raw_keep}")
 
-        # 4. build X/Y from the panel using ONLY those raw columns; keep categoricals
-        #    NATIVE (no one-hot) so the tuned model can split on them directly.
         cvr_data = pd.read_csv(CVR_path)
         Y = cvr_data["cvr"].clip(0.0, 1.0)
         X = cvr_data[[c for c in raw_keep if c in cvr_data.columns]].copy()
@@ -395,27 +290,143 @@ class MarketEnv:
             X[c] = X[c].astype("category")
         cat_mask = [c in cat_in_X for c in X.columns]
 
-        # 5. refit the tuned model on the selected features
         X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.4, random_state=0)
         best_tuned = HistGradientBoostingRegressor(
-            max_iter=200,
-            learning_rate=0.08,
-            max_leaf_nodes=31,
-            min_samples_leaf=10,
-            l2_regularization=0.5,
+            max_iter=300,              # Increased: Gives the model more steps to find patterns
+            learning_rate=0.03,        # Decreased: Slower learning prevents overshooting tiny CVR decimals
+            max_leaf_nodes=31,         # Keeps trees complex enough to find non-linear CVR patterns
+            min_samples_leaf=5,        # LOWERED: Allows splits on smaller, high-converting product categories
+            l2_regularization=0.05,    # AGGRESSIVELY LOWERED: Prevents the model from smothering weak signals
             categorical_features=cat_mask,
             random_state=0,
         )
         best_tuned.fit(X_train, Y_train)
         cls._CVR_MODEL = best_tuned
-        print(f"[cvr] refit on {X.shape[1]} raw cols -> holdout R^2 = {best_tuned.score(X_test, Y_test):.3f}")
+        
+        cls._CVR_FEATURES = list(X.columns)
+        cls._CVR_CAT_COLS = cat_in_X
+        cls._CVR_CAT_LEVELS = {c: list(X[c].cat.categories) for c in cat_in_X}
+
         return X_test, Y_test, cls._CVR_MODEL
 
 
-    @classmethod
-    def predict_demand(cls):
-        pass 
 
+
+    @classmethod
+    def _cvr_panel(cls):
+        if cls._CVR_PANEL_DF is None:
+            cls._CVR_PANEL_DF = pd.read_csv(CVR_path)
+        return cls._CVR_PANEL_DF
+
+    @classmethod
+    def _snapshot_cvr_features(cls, asin):
+      
+        if cls._CVR_FEATURES is None:
+            return None
+        
+        panel = cls._cvr_panel()
+        rows = panel[panel["asin"].astype(str) == str(asin)] if "asin" in panel.columns else panel.iloc[0:0]
+
+        cat_cols = cls._CVR_CAT_COLS or []
+        snap = {}
+        for col in cls._CVR_FEATURES:
+            if rows.empty or col not in panel.columns:
+                snap[col] = np.nan
+            elif col in cat_cols:
+                m = rows[col].mode(dropna=True)
+                snap[col] = m.iloc[0] if not m.empty else np.nan
+            else:
+                snap[col] = float(pd.to_numeric(rows[col], errors="coerce").median())
+        return snap
+
+   
+    def bind_target_features(self, asin):
+
+        self._cvr_feat_snapshot = self._snapshot_cvr_features(asin)
+        self._buybox_feat_snapshot = self._snapshot_buybox_features(asin)
+        return self._cvr_feat_snapshot
+
+    def predict_cvr(self, own_price, buybox_pred, comp_ref=None, week=None):
+
+        if self._CVR_MODEL is None:
+            self.fit_cvr()
+
+        if comp_ref is None:
+            comp_ref = self._competitor_reference()
+        if week is None:
+            week = ((getattr(self, "start_week", 1) - 1 + getattr(self, "t", 0)) % 52) + 1
+
+
+        snap = getattr(self, "_cvr_feat_snapshot", None)
+        row = dict(snap) if snap else {f: np.nan for f in self._CVR_FEATURES}
+
+        month = int(min(12, max(1, int((int(week) - 1) // 4.345) + 1)))
+        dyn = {
+            "price": float(own_price),
+            "buybox_pct": float(buybox_pred) * 100.0,
+            "listing_price": float(own_price),
+            "bb_price": float(comp_ref) if comp_ref else np.nan,
+            "week_of_year": float(week),
+            "month": float(month),
+            "buybox_pct" : buybox_pred
+        }
+        for k, v in dyn.items():
+            if k in row:                    
+                row[k] = v
+
+        X_df = pd.DataFrame([row])[self._CVR_FEATURES]      # enforce trained column order
+        levels = self._CVR_CAT_LEVELS or {}
+        for c in (self._CVR_CAT_COLS or []):                # rebuild with the fitted levels
+            X_df[c] = pd.Categorical(X_df[c], categories=levels.get(c))
+
+        return float(np.clip(self._CVR_MODEL.predict(X_df)[0], 0.0, 1.0))
+    
+    def _buybox_prob(self, own_price, comp_ref=None, week=None):
+
+        if comp_ref is None:
+            comp_ref = self._competitor_reference()
+
+
+        if self._BUYBOX_MODEL is None:
+            self.fit_buybox()
+
+
+        gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0
+        if week is None:
+            week = ((getattr(self, "start_week", 1) - 1 + getattr(self, "t", 0)) % 52) + 1
+
+        if self._BUYBOX_MODEL is not None and self._BUYBOX_FEATURES is not None:
+            snap = getattr(self, "_buybox_feat_snapshot", None)
+            row = dict(snap) if snap else {f: np.nan for f in self._BUYBOX_FEATURES}
+            ship = float(row.get("own_shipping") or 0.0)
+            dyn = {
+                "price": float(own_price),
+                "own_shipping": ship,
+                "own_landed": float(own_price) + ship,      # item + own shipping
+            }
+            for k, v in dyn.items():
+                if k in row:
+                    row[k] = v
+            X_df = pd.DataFrame([row])[self._BUYBOX_FEATURES]       # trained column order
+            levels = self._BUYBOX_CAT_LEVELS or {}
+            for c in (self._BUYBOX_CAT_COLS or []):                # align to fitted levels
+                X_df[c] = pd.Categorical(X_df[c], categories=levels.get(c))
+            base = float(np.clip(self._BUYBOX_MODEL.predict(X_df)[0], 1e-4, 1.0 - 1e-4))
+
+        
+            coef = float(self.params.get("buybox_gap_coef", -12.0))
+            logit = np.log(base / (1.0 - base)) + coef * gap
+            logit = float(np.clip(logit, -30.0, 30.0))
+            return float(1.0 / (1.0 + np.exp(-logit)))
+
+
+        z = (self.params.get("buybox_intercept", 1.0)
+             + self.params.get("buybox_gap_coef", -12.0) * gap
+             + self.params.get("buybox_fba_coef", 0.5) * self.own_fba
+             + self.params.get("buybox_prime_coef", 0.5) * self.own_prime
+             + self.params.get("buybox_feedback_coef", 0.1) * self.own_feedback)
+        z = float(np.clip(z, -30.0, 30.0))
+        return 1.0 / (1.0 + np.exp(-z))
 
 
     def _draw_demand(self, mean):
@@ -430,10 +441,10 @@ class MarketEnv:
     def expected_demand(self, own_price):
         comp_ref = self._competitor_reference()
         bb_prob = self._buybox_prob(own_price, comp_ref)
-        cvr = self.predict_cvr(own_price, comp_ref)
+        cvr = self.predict_cvr(own_price, bb_prob, comp_ref)
 
-        # Expected demand is the combination of visibility, intent, and traffic
-        return self._sessions() * bb_prob * cvr
+
+        return self._sessions() * cvr
 
 
     # ---- RL interface --------------------------------------------------
@@ -441,6 +452,10 @@ class MarketEnv:
 
         row = target_product.iloc[0]
         self.target = target_product
+
+        # Snapshot this product's static CVR features into the trained schema so
+        # predict_cvr has real brand/product_type/quality values to reason over.
+        self.bind_target_features(row.get(("clean", "asin")))
 
         raw = float(pd.to_numeric(pd.Series([row[PRICE_COL]]), errors="coerce").iloc[0])
         self.own_price = raw * self.params["price_scale"] + self.params["price_center"]
@@ -510,30 +525,7 @@ class MarketEnv:
         week = ((self.start_week - 1 + t) % 52) + 1
         return self.params["seasonal_index"][week - 1]
 
-    def _buybox_prob(self, own_price, comp_ref, week=None):
-        # gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0
-        # # Same clock as predict_cvr / _seasonal_multiplier: default to the week currently
-        # # being simulated (start_week + t); the backtest passes the real historical week.
-        # if week is None:
-        #     week = ((getattr(self, "start_week", 1) - 1 + getattr(self, "t", 0)) % 52) + 1
-
-        # # _BUYBOX_MODEL is now a REGRESSOR predicting the buy-box SHARE (0-1) from
-        # # [gap, fba, prime, feed, week] -- feature order must match _estimate_buybox exactly.
-        # # Clip since a regressor can overshoot [0,1].
-        # if self._BUYBOX_MODEL is not None:
-        #     X = np.array([[gap, self.own_fba, self.own_prime, self.own_feedback, float(week)]], dtype=float)
-        #     return float(np.clip(self._BUYBOX_MODEL.predict(X)[0], 0.0, 1.0))
-
-        # # No model fit (DB unavailable / too little data): logistic fallback on the
-        # # stored coefficients still yields a [0,1] share.
-        # z = (self.params["buybox_intercept"]
-        #      + self.params["buybox_gap_coef"] * gap
-        #      + self.params["buybox_fba_coef"] * self.own_fba
-        #      + self.params["buybox_prime_coef"] * self.own_prime
-        #      + self.params["buybox_feedback_coef"] * self.own_feedback)
-        # z = float(np.clip(z, -30.0, 30.0))
-        z = 1
-        return 1.0 / (1.0 + np.exp(-z))
+   
 
     def _competitor_prices(self, strategy_type):
 
@@ -587,39 +579,7 @@ class MarketEnv:
                 print(f"Strategy {strategy_type} not recognized. Falling back to static.")
                 return base_prices
 
-    # ---- helpers -------------------------------------------------------
-    def predict_cvr(self, own_price, comp_ref=None, week=None):
 
-        if self._CVR_MODEL is None:
-            return 0.03
-
-        if comp_ref is None:
-            comp_ref = self._competitor_reference()
-        if week is None:
-            week = ((getattr(self, "start_week", 1) - 1 + getattr(self, "t", 0)) % 52) + 1
-
-        feedback_count_default = self.params.get("buybox_feedback_median", 100.0)
-        feedback_count_log = np.log(feedback_count_default + 1)
-        seller_score = feedback_count_log * self.own_feedback
-
-        # Normalise by this cluster's reference price so the features are in the
-        # same "fraction of typical price" space the model was trained on (train
-        # divides by the per-product_type median; here we divide by the cluster
-        # reference, the predict-time analogue). Feature names/order must match
-        # _estimate_conversion_rate's X_df exactly.
-        ref = self.params.get("reference_price") or 1.0
-        X_df = pd.DataFrame([{
-            'price_ratio': float(own_price / ref),
-            'min_price_ratio': float(comp_ref / ref),
-            'listing_ratio': float(own_price / ref),
-            'shipping_ratio': 0.0,                  # Assuming FBA free shipping
-            'daily_average_offer_position': 1.0,    # Assuming Buy Box placement to convert
-            'prime_availability': float(self.own_prime),
-            'seller_score': float(seller_score),
-            'week_of_year': float(week),            # <-- time feature (order must match training)
-        }])
-
-        return float(np.clip(self._CVR_MODEL.predict(X_df)[0], 0.0, 1.0))
 
     def plot_cvr_seasonality(self, prices=None, path=None):
         """Diagnostic: the model's predicted CVR across all 52 weeks at fixed price
@@ -637,8 +597,12 @@ class MarketEnv:
 
         weeks = np.arange(1, 53)
         fig, ax = plt.subplots(figsize=(11, 5))
+        cref = self._competitor_reference()
         for p in prices:
-            cvr = [self.predict_cvr(float(p), week=int(w)) for w in weeks]
+            cvr = [self.predict_cvr(float(p),
+                                    self._buybox_prob(float(p), cref, week=int(w)),
+                                    week=int(w))
+                   for w in weeks]
             ax.plot(weeks, cvr, lw=2, marker="o", ms=3, label=f"price €{p:.2f}")
         fitted = "fitted" if self._CVR_MODEL is not None else "CONSTANT 0.03 fallback"
         ax.set_xlabel("ISO week")
@@ -667,7 +631,6 @@ class MarketEnv:
     def _competitor_reference(self):
         return float(self.comp_prices.min()) if self.comp_prices.size else self.params["reference_price"]
 
-    # ---- 2-player: the RL competitor's state & payoff ------------------
     def _competitor_state(self):
        
 
@@ -686,7 +649,8 @@ class MarketEnv:
         (1 - our_buybox) share of sessions. CVR reuses our model with the competitor's
         price (seller-side features are approximated as symmetric)."""
         bb_us = self._buybox_prob(self.own_price, comp_price)
-        comp_units = self._sessions() * (1.0 - bb_us) * self.predict_cvr(comp_price, comp_ref=self.own_price)
+        comp_units = self._sessions() * (1.0 - bb_us) * self.predict_cvr(
+            comp_price, 1.0 - bb_us, comp_ref=self.own_price)
         return (comp_price - self.comp_cost) * comp_units
 
     # ---- persistence ---------------------------------------------------

@@ -93,3 +93,17 @@ what I realized is that the core issue that I have is the profit model , I do no
 
 
     the thing is that the reward comes from the units sold which then I guess is a poor demand prediction model even though the plots dont look unreasonable
+
+
+
+### 22/07/26 
+
+Now for the prediction of the cvr we use the feature panel for the cvr and the  - so this will need to be updated periodically which is not really a problem since it is pretty quick 
+right nw the predict cvr takes in the predict bbox to get a better prediction 
+
+
+Cluster-relative pricing as the buy-box competitor signal. The buy-box model can't learn competitive dynamics directly, because the SP-API competitor-price columns (lowest_price, bb_price, offer_count, …) are only ~2 weeks deep and get dropped as near-empty. The fix is to substitute a proxy competitor built from the vn product clustering: every product is assigned to a community of close substitutes, and each community's median price (converted back to the real-price scale via _price_scale, so it matches the SP-API prices) becomes that product's competitive reference. This median is folded into the BBox training panel as a per-product feature (alongside a price / cluster_median ratio that makes the competitiveness explicit), so fit_buybox learns how being priced above or below one's cluster moves buy-box ownership — instead of that response being a hand-set constant. At inference, _buybox_prob feeds the current cluster reference into the same feature, so the learned competitive curve transfers directly and the hand-tuned gap coefficient can be retired. The end product is a buy-box predictor whose price sensitivity is grounded in data rather than assumed, chained into the CVR → demand model, which finally gives the RL pricing agent a real, learned incentive to price competitively against its cluster peers rather than drifting toward the margin-maximizing corner.
+
+
+
+I realized that in order to be able to do this properly I needed to train the cvr and the bbox sepparately because they require a whole other level of data management

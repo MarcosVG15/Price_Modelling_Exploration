@@ -184,16 +184,17 @@ def add_predictions(weekly, env):
   
 
     weeks = weekly["data_date"].dt.isocalendar().week.astype(int).clip(1, 52)
-    weekly["pred_cvr"] = [env.predict_cvr(float(p), week=int(w))
-                          for p, w in zip(price_for_model, weeks)]
-    weekly["pred_units"] = weekly["sessions"] * weekly["pred_cvr"]
 
-    # Predicted buy-box % : the model now REGRESSES the buy-box share (0-1); x100 to
-    # compare directly with the real buy_box_percentage, using each week's price vs the
-    # fitted competitor reference.
+    # Buy-box share (0-1) first: it feeds BOTH the chained CVR prediction and the
+    # displayed pred_buybox, so compute it once against the fitted competitor reference.
     comp_ref = env._competitor_reference()
-    weekly["pred_buybox"] = [100.0 * env._buybox_prob(float(p), comp_ref, week=int(w))
-                             for p, w in zip(price_for_model, weeks)]
+    bb_share = [env._buybox_prob(float(p), comp_ref, week=int(w))
+                for p, w in zip(price_for_model, weeks)]
+    weekly["pred_buybox"] = [100.0 * b for b in bb_share]     # x100 to compare with real buy_box_percentage
+
+    weekly["pred_cvr"] = [env.predict_cvr(float(p), b, week=int(w))
+                          for p, b, w in zip(price_for_model, bb_share, weeks)]
+    weekly["pred_units"] = weekly["sessions"] * weekly["pred_cvr"]
     
     n_draws = 500
     draws = np.array([[env._draw_demand(m) for m in weekly["pred_units"]]
@@ -407,7 +408,7 @@ def main2():
     asin = pick_backtest_target(vn, override)
     cluster_id = cluster_of_asin(vn, asin)
     env = MarketEnv.for_cluster(vn, cluster_id)   # triggers/loads the global CVR model
-    X_test, Y_test, bbox_model  = MarketEnv.predict_cvr()
+    X_test, Y_test, bbox_model  = MarketEnv.fit_cvr()
     output = bbox_model.predict(X_test)
 
     mae = mean_absolute_error(Y_test, output)

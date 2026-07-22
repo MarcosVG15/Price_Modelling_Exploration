@@ -54,9 +54,7 @@ Things that I need to take into account  :
 
 
 def extract_target_data(all_data, n, random_state=None):
-    """Randomly sample n UNIQUE products from all_data and return them as a
-    DataFrame to pass to the predictor as target_data. Uniqueness is by product
-    id (ASIN_COL), so duplicate listings of the same product can't both appear."""
+  
     unique = all_data.drop_duplicates(subset=[ASIN_COL])
     n = min(n, len(unique))
     rng = np.random.default_rng(random_state)
@@ -66,9 +64,7 @@ def extract_target_data(all_data, n, random_state=None):
 
 
 def export_clusters_csv(vn, all_data, search_term, out_dir="data_files"):
-    """Write all feature data plus a ('cluster','community') column (the product's
-    community from svd_product_communities) to a CSV, sorted by cluster so the
-    groups are contiguous for inspection. Labels align positionally with all_data."""
+   
     labels = vn.product_labels
     if len(labels) != len(all_data):
         raise ValueError(f"labels ({len(labels)}) != rows ({len(all_data)}); "

@@ -1,4 +1,6 @@
 import os
+import re
+import traceback
 from pathlib import Path
 from datetime import date, timedelta
 import pandas as pd
@@ -46,12 +48,43 @@ def extract_keyword_ids(level, value):
     return df["id"].tolist()
 
 
+def extract_search_terms(level):
+    # All distinct segmentation values at this level, so the caller doesn't have
+    # to hardcode a single search term. Deduped case-insensitively: the same
+    # category can appear with different casing (e.g. "Photo & video" vs
+    # "Photo & Video"), and ILIKE would match both anyway.
+    if level not in SEGMENTATION_COLUMNS:
+        raise ValueError(f"level must be one of {list(SEGMENTATION_COLUMNS)}")
 
-def extract_feature_para(paragraphs):
+    column = SEGMENTATION_COLUMNS[level]          # safe: comes from the whitelist
+
+    engine = create_engine(SCRAPE_DATABASE_URL)
+    query = text(f"""
+        SELECT DISTINCT ON (LOWER({column})) {column} AS term
+        FROM key_words
+        WHERE {column} IS NOT NULL AND {column} <> ''
+        ORDER BY LOWER({column}), {column}
+    """)
+
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn)
+
+    return df["term"].tolist()
+
+
+def slugify(term):
+    # Filesystem-safe stand-in for a search term in output paths (terms can
+    # contain spaces, "&", etc.); the term itself still goes into the DB query
+    # and log lines unchanged.
+    return re.sub(r"[^A-Za-z0-9]+", "_", term).strip("_")
+
+
+def extract_feature_para(paragraphs, tfe=None):
     # Build a per-paragraph feature table: one row per product, columns are a 2-level
     # MultiIndex (paragraph_N, feature_name) so we KEEP TRACK of which paragraph each
     # feature came from. Feeds straight into merge_tables (already MultiIndexed).
-    tfe = textual_feature_extractors()
+    if tfe is None:
+        tfe = textual_feature_extractors()
     feature_names = list(tfe.STYLISTIC_FEATURES)
 
     base_cols = ['product_id', 'keyword_id', 'market_id']
@@ -156,8 +189,47 @@ def attach_real_identifiers(data, id_col=("clean", "asin_ean_id")):
     return data
 
 
-def main(lookback_days=45):
+def process_search_term(search_term, granularity, time_frame, tfe):
+    keyword_ids = extract_keyword_ids(granularity, search_term)
+    if not keyword_ids:
+        print(f"[{search_term}] no matching keyword_ids; skipping")
+        return
+
+    paragraphs = paragraph_extraction(keyword_ids, time_frame=time_frame).extract_all_data()
+    print(f"[{search_term}] paragraphs shape:", paragraphs.shape)
+
+    # pre process the paragraphs such that i will have feature vectors instead of just paragrphs
+    para_data = extract_feature_para(paragraphs, tfe=tfe)
+
+    grouped, (clean, data_dict) = clean_system(keyword_ids, time_frame=time_frame).run()
+    print(f"[{search_term}] grouped shape:", grouped.shape)
+
+    merged_data = merge_tables(para_data, ("clean", grouped), None)
+    if merged_data.empty:
+        print(f"[{search_term}] merged table is empty; skipping save")
+        return
+
+    slug = slugify(search_term)
+    type_cache = f"data_files/feature_types_{slug}.json"
+    feature_types = load_type_cache(type_cache) if os.path.exists(type_cache) else None
+    merged_data = Normalizer().fit_transform(merged_data, feature_types=feature_types)
+
+    # Resolve internal asin_ean_id -> real ASIN/EAN so the saved file can join to
+    # the SP-API DB. Done AFTER normalize so the identifier strings stay intact.
+    merged_data = attach_real_identifiers(merged_data)
+
+    out_path = f"data_files/all_feature_data_{slug}.csv"
+    merged_data.to_csv(out_path, index=False)
+    print(f"[{search_term}] saved -> {out_path}")
+
+
+def main(granularity=1, lookback_days=45):
     """
+    granularity: which Segmentation_level (1/2/3) to pull distinct search terms
+    from and to resolve keyword_ids with. This is the one knob meant to be
+    changed run-to-run; everything else (which terms exist, their keyword_ids)
+    is discovered from the database.
+
     lookback_days: how far back (in days) to pull scraped listings from. A narrow
     window captures a more homogeneous slice of the catalog (fewer distinct
     sellers/product types), which raises feature-presence density -- TF-IDF then
@@ -166,62 +238,36 @@ def main(lookback_days=45):
     through a near-flat modularity landscape. Widen this (e.g. 90) if that happens.
     """
 
-    #  i need this to load from the database
     #  this will be then run on a two week basis in order to be able to always have up to date files in the actual systen
 
-
-    granularity = 1
-    search_term = 'Audio'
     time_frame = date.today() - timedelta(days=lookback_days)
+    search_terms = extract_search_terms(granularity)
+    print(f"Found {len(search_terms)} search terms at granularity {granularity}: {search_terms}")
 
-    keyword_ids = extract_keyword_ids(granularity, search_term)
-    paragraphs = paragraph_extraction(keyword_ids, time_frame=time_frame).extract_all_data()
-    print("paragraphs shape:", paragraphs.shape)
+    os.makedirs("data_files", exist_ok=True)
 
-    # pre process the paragraphs such that i will have feature vectors instead of just paragrphs
-    para_data = extract_feature_para(paragraphs)
-    print(para_data.head())
+    # Loaded once and reused across every term -- these are heavy GPU-backed
+    # models (SentenceTransformer, zero-shot classifier); reloading them per
+    # term would dominate the runtime once there's more than one.
+    tfe = textual_feature_extractors()
 
-
-    grouped, (clean, data_dict) = clean_system(keyword_ids, time_frame=time_frame).run()
-    print("grouped shape:", grouped.shape)
-
-    # reduce the vectors such that i dont have any duplicate between it and paragraphs data
-
-
-    #  Include image features. 
-    ''' 
-    
-    This will be section where I will do some feature extraction on the images. 
-    
-    '''
-
-
-    # # para_data already carries per-paragraph (paragraph_N, feature) MultiIndex columns.
-    # # grouped is flat -> label it 'clean'. image features not built yet -> None (skipped).
-    merged_data = merge_tables(para_data, ("clean", grouped), None)
-
-    # Normalize right before saving so the file always holds clean, standardized
-    # data. Types come from the pipeline's feature-type cache when it exists
-    # (keeps this file consistent with how the voting stages read it); on a brand
-    # new search term the cache isn't there yet and types are auto-detected.
-    type_cache = f"data_files/feature_types_{search_term}.json"
-    feature_types = load_type_cache(type_cache) if os.path.exists(type_cache) else None
-    merged_data = Normalizer().fit_transform(merged_data, feature_types=feature_types)
-
-    # Resolve internal asin_ean_id -> real ASIN/EAN so the saved file can join to
-    # the SP-API DB. Done AFTER normalize so the identifier strings stay intact.
-    merged_data = attach_real_identifiers(merged_data)
-
-    merged_data.to_csv(f"data_files/all_feature_data_{search_term}.csv", index=False)
+    for search_term in search_terms:
+        print(f"\n=== {search_term} ===")
+        try:
+            process_search_term(search_term, granularity, time_frame, tfe)
+        except Exception:
+            print(f"[{search_term}] failed, skipping")
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
     import sys
-    # python load_data_excel.py [lookback_days]
-    # No arg -> fall through to main()'s own default (single source of truth),
-    # so the signature default can't be silently overridden here.
-    if len(sys.argv) > 1:
+    # python load_data_excel.py [lookback_days] [granularity]
+    # No arg -> fall through to main()'s own defaults (single source of truth),
+    # so the signature defaults can't be silently overridden here.
+    if len(sys.argv) > 2:
+        main(lookback_days=int(sys.argv[1]), granularity=int(sys.argv[2]))
+    elif len(sys.argv) > 1:
         main(lookback_days=int(sys.argv[1]))
     else:
         main()
