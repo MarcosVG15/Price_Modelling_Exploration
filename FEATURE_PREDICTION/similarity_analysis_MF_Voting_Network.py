@@ -222,4 +222,4 @@ if __name__ == "__main__":
     scores = calculate_unified_score(results, vn, resolutions)
     # Find the best k automatically
     best_k = max(scores, key=scores.get)
-    print(f"\n[RECOMMENDATION] The optimal parameter is k = {best_k} with a score of {scores[best_k]:.2f}")
+    print(f"\n[RECOMMENDATION] The optimal parameter is k = {best_k} with a score of {scores[best_k]:.2f}") 

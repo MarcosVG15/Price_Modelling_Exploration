@@ -1,11 +1,21 @@
+
+import os 
+
+import shap
+import joblib
 import numpy as np
 import pandas as pd 
 
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 '''  
-
- for each of the csv generate a vn cluster network and add it to a dict such that you can reference based on the segmenation level 
+for each of the csv generate a vn cluster network and add it to a dict such that you can reference based on the segmenation level 
 
 
 for this you will need to extract all of the search terms for a specific segmentation level that were used to load the data
@@ -22,141 +32,323 @@ We will do a shap analysis on the features to understand which are important to 
     
 
 Storing 
-
 The model will be stored in a joblib file for easy access - later this model will be updated every 3 weeks or so - I dont fuking know
 
-
-
 TESTING 
-
 for the commax product we will for each period stored in the csv we will predict the buybox percetange vs the actual one and see how much they differ in size
-
-
-
-
 '''
+
 
 
 class create_bbox_predictor : 
 
     #  this method needs to know the location of the path that contains all of the csv that will be used to train the cvr predictor
-    def __init__(self , cvs_folder_path , seg_level):
+    def __init__(self , cvs_folder_path , seg_level, seg_terms):
         self.folder_path = cvs_folder_path
         self.seg_level = seg_level
 
-        self.aggregate_data = 
-
-    def load_data(self , key_word ) :
+        self.aggregate_data = None
 
 
+        for term in seg_terms : 
+            temp_data = pd.read_csv(f'{self.folder_path}/all_feature_data_{term}.csv')
+            self.aggregate_data = self.union(self.aggregate_data , temp_data)
 
-    # def extract_feature_importance_BBox(cls):
-                
-    #     if not os.path.exists(BBOX_path):
-    #         raise FileNotFoundError(
-    #             f"buy-box feature panel not found: {BBOX_path}\n"
-    #             f"Run `python GAME_THEORY_PREDICTION/BBOX/build_feature_panel_BBox.py` first.")
-    #     shap_data = pd.read_csv(BBOX_path)
 
-    #     # drop identifiers, the target, demand OUTCOMES, and the duplicate raw
-    #     # price sources (keep the coalesced+ffilled `price`).
-    #     drop_columns = [
-    #         "asin", "marketplace_id", "week", "buybox_pct",
-    #         "units", "sessions", "revenue",
-    #         "implied_price", "oi_price", "listing_price", "raw_price",
-    #         "rank_value", "main_browser_node_id",
-    #     ]
+        HERE = os.path.dirname(os.path.abspath(__file__))
+        self.BBOX_path = os.path.join(HERE, "bbox_feature_panel.csv")
 
-    #     Y = (shap_data["buybox_pct"] / 100.0).clip(0.0, 1.0)   # buy-box share in [0, 1]
-    #     X = shap_data.drop(columns=[c for c in drop_columns if c in shap_data.columns])
+        self.BUYBOX_SHAP_MODEL = None
+        self.BUYBOX_SHAP_MODEL_PATH = os.path.join(HERE, "bbox_shap_model.joblib")
 
-    #     # near-empty numeric cols (the ~2-week competition/stock snapshots over a
-    #     # 2-yr panel) break HistGBR's binning -> drop anything under 2% coverage.
-    #     sparse = [c for c in X.columns if X[c].notna().mean() < 0.02]
-    #     X = X.drop(columns=sparse)
+        self._BUYBOX_MODEL = None
+        self._BUYBOX_MODEL_PATH = os.path.join(HERE, "bbox_model.joblib")
+        self._BUYBOX_FEATURES = None
+        self._BUYBOX_CAT_COLS = None
+        self._BUYBOX_CAT_LEVELS = None
+        self._BUYBOX_X_test = None
+        self._BUYBOX_Y_test = None
 
-    #     # one-hot the low-card string/bool categoricals so SHAP never sees a str.
-    #     cat_cols = [c for c in ["brand", "product_type", "manufacturer", "has_aplus"]
-    #                 if c in X.columns]
-    #     X = pd.get_dummies(X, columns=cat_cols, drop_first=True).astype(float)
-    #     print(f"[shap-bbox] {X.shape[1]} features; dropped {len(sparse)} near-empty cols: {sparse}")
+        self._BUYBOX_PANEL_DF = None
 
-    #     X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.3, random_state=0)
 
-    #     model = HistGradientBoostingRegressor(max_iter=200, random_state=0)
-    #     model.fit(X_train, Y_train)
-    #     cls._BUYBOX_SHAP_MODEL = {'model': model , 'features': X}            
-    
+    def get_model_shap(self):
+        return self._load_shap_model()
 
-    # def fit_buybox(cls, top_k=15):
+    def get_model(self):
+        return self._load_buybox_model()
+
+    def reset_models(self):
+  
+        for path in (self.BUYBOX_SHAP_MODEL_PATH, self._BUYBOX_MODEL_PATH):
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"[bbox] removed {path}")
+
+        self.BUYBOX_SHAP_MODEL = None
+        self._BUYBOX_MODEL = None
+        self._BUYBOX_FEATURES = None
+        self._BUYBOX_CAT_COLS = None
+        self._BUYBOX_CAT_LEVELS = None
+        self._BUYBOX_X_test = None
+        self._BUYBOX_Y_test = None
+
+
+    #  this method should check what columns coiincide and merge the data and if not add new columns
+    def union(self , aggregate_data , temp_data ) :
+        return pd.concat([aggregate_data, temp_data], axis=0, ignore_index=True)
+
+
+    def _load_shap_model(self):
+
+        if self.BUYBOX_SHAP_MODEL is not None:
+            return self.BUYBOX_SHAP_MODEL
+
+        if os.path.exists(self.BUYBOX_SHAP_MODEL_PATH):
+            try:
+                self.BUYBOX_SHAP_MODEL = joblib.load(self.BUYBOX_SHAP_MODEL_PATH)
+                return self.BUYBOX_SHAP_MODEL
+            except Exception as e:
+                print(f"[bbox] cached SHAP model at {self.BUYBOX_SHAP_MODEL_PATH} unreadable ({e}); retraining")
+
+        self.extract_feature_importance_BBox()
+        return self.BUYBOX_SHAP_MODEL
+
+    def _load_buybox_model(self):
+
+        if self._BUYBOX_MODEL is not None and self._BUYBOX_X_test is not None:
+            return self._BUYBOX_MODEL
+
+        if os.path.exists(self._BUYBOX_MODEL_PATH):
+            bundle = None
+            try:
+                bundle = joblib.load(self._BUYBOX_MODEL_PATH)
+            except Exception as e:
+                print(f"[bbox] cached model at {self._BUYBOX_MODEL_PATH} unreadable ({e}); retraining")
+
+            if bundle is not None:
+                self._BUYBOX_MODEL = bundle["model"]
+                self._BUYBOX_FEATURES = bundle["features"]
+                self._BUYBOX_CAT_COLS = bundle["cat_cols"]
+                self._BUYBOX_CAT_LEVELS = bundle["cat_levels"]
+
+                bbox_data = pd.read_csv(self.BBOX_path)
+                Y = (bbox_data["buybox_pct"] / 100.0).clip(0.0, 1.0)
+                X = bbox_data[[c for c in self._BUYBOX_FEATURES if c in bbox_data.columns]].copy()
+                for c in self._BUYBOX_CAT_COLS:
+                    X[c] = X[c].astype("category")
+                _, X_test, _, Y_test = train_test_split(X, Y, test_size=0.4, random_state=0)
+                self._BUYBOX_X_test = X_test
+                self._BUYBOX_Y_test = Y_test
+                return self._BUYBOX_MODEL
+
+        self.fit_buybox()
+        return self._BUYBOX_MODEL
+
+
+    def extract_feature_importance_BBox(self):
+        if not os.path.exists(self.BBOX_path):
+            raise FileNotFoundError(
+                f"buy-box feature panel not found: {self.BBOX_path}\n"
+                f"Run `python GAME_THEORY_PREDICTION/BBOX/build_feature_panel_BBox.py` first.")
+        shap_data = pd.read_csv(self.BBOX_path)
+
+        drop_columns = [
+            "asin", "marketplace_id", "week", "buybox_pct",
+            "units", "sessions", "revenue",
+            "implied_price", "oi_price", "listing_price", "raw_price",
+            "rank_value", "main_browser_node_id",
+        ]
+
+        Y = (shap_data["buybox_pct"] / 100.0).clip(0.0, 1.0)  
+        X = shap_data.drop(columns=[c for c in drop_columns if c in shap_data.columns])
+
+        sparse = [c for c in X.columns if X[c].notna().mean() < 0.02]
+        X = X.drop(columns=sparse)
+        cat_cols = [c for c in ["brand", "product_type", "manufacturer", "has_aplus"]
+                    if c in X.columns]
         
-    #     if cls._BUYBOX_SHAP_MODEL is None:
-    #         cls.extract_feature_importance_BBox()
-    #     model = cls._BUYBOX_SHAP_MODEL["model"]
-    #     feats = cls._BUYBOX_SHAP_MODEL["features"]
+        X = pd.get_dummies(X, columns=cat_cols, drop_first=True).astype(float)
+        print(f"[shap-bbox] {X.shape[1]} features; dropped {len(sparse)} near-empty cols: {sparse}")
 
-    #     shap_vals = shap.TreeExplainer(model).shap_values(feats.iloc[:2000])
-    #     importance = (pd.Series(abs(shap_vals).mean(axis=0), index=feats.columns)
-    #                     .sort_values(ascending=False))
-    #     top_features = importance.index.tolist()[:top_k]
+        X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.3, random_state=0)
 
-    #     cats = ["brand", "product_type", "manufacturer", "has_aplus"]
-    #     raw_keep = []
-    #     for f in top_features:
-    #         parent = next((c for c in cats if f == c or f.startswith(c + "_")), f)
-    #         raw_keep.append(parent)
-    #     raw_keep = list(dict.fromkeys(raw_keep))          # dedupe, preserve order
-    #     print(f"[bbox] top {top_k} one-hot features -> {len(raw_keep)} raw cols: {raw_keep}")
+        model = HistGradientBoostingRegressor(max_iter=200, random_state=0)
+        model.fit(X_train, Y_train)
+        self.BUYBOX_SHAP_MODEL = {'model': model , 'features': X}
+        joblib.dump(self.BUYBOX_SHAP_MODEL, self.BUYBOX_SHAP_MODEL_PATH)
+        print(f"[bbox] saved SHAP-ranking model -> {self.BUYBOX_SHAP_MODEL_PATH}")
 
-    #     # build X/Y from the panel using ONLY those raw columns; keep categoricals NATIVE
-    #     bbox_data = pd.read_csv(BBOX_path)
-    #     Y = (bbox_data["buybox_pct"] / 100.0).clip(0.0, 1.0)
-    #     X = bbox_data[[c for c in raw_keep if c in bbox_data.columns]].copy()
-    #     cat_in_X = [c for c in cats if c in X.columns]
-    #     for c in cat_in_X:
-    #         X[c] = X[c].astype("category")
-    #     cat_mask = [c in cat_in_X for c in X.columns]
 
-    #     X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.4, random_state=0)
-    #     best_tuned = HistGradientBoostingRegressor(
-    #         max_iter=200, learning_rate=0.08, max_leaf_nodes=31,
-    #         min_samples_leaf=10, l2_regularization=0.5,
-    #         categorical_features=cat_mask, random_state=0,
-    #     )
-    #     best_tuned.fit(X_train, Y_train)
-    #     cls._BUYBOX_MODEL = best_tuned
-    #     cls._BUYBOX_FEATURES = list(X.columns)
-    #     cls._BUYBOX_CAT_COLS = cat_in_X
-    #     cls._BUYBOX_CAT_LEVELS = {c: list(X[c].cat.categories) for c in cat_in_X}
-    #     print(f"[bbox] refit on {X.shape[1]} raw cols -> holdout R^2 = {best_tuned.score(X_test, Y_test):.3f}")
-    #     return X_test, Y_test, cls._BUYBOX_MODEL
-    
+    def fit_buybox(self, top_k=15):
 
-    #  @classmethod
-    #     def _buybox_panel(cls):
-    #         if cls._BUYBOX_PANEL_DF is None:
-    #             cls._BUYBOX_PANEL_DF = pd.read_csv(BBOX_path)
-    #         return cls._BUYBOX_PANEL_DF
-    
-    #     @classmethod
-    #     def _snapshot_buybox_features(cls, asin):
-    #         # Per-product snapshot of the buy-box panel: median for numerics, mode for
-    #         # categoricals. price/own_landed/own_shipping are overwritten at predict time.
-    #         if cls._BUYBOX_FEATURES is None:
-    #             return None
-    
-    #         panel = cls._buybox_panel()
-    #         rows = panel[panel["asin"].astype(str) == str(asin)] if "asin" in panel.columns else panel.iloc[0:0]
-    
-    #         cat_cols = cls._BUYBOX_CAT_COLS or []
-    #         snap = {}
-    #         for col in cls._BUYBOX_FEATURES:
-    #             if rows.empty or col not in panel.columns:
-    #                 snap[col] = np.nan
-    #             elif col in cat_cols:
-    #                 m = rows[col].mode(dropna=True)
-    #                 snap[col] = m.iloc[0] if not m.empty else np.nan
-    #             else:
-    #                 snap[col] = float(pd.to_numeric(rows[col], errors="coerce").median())
-    #         return snap
-    
+        shap_bundle = self._load_shap_model()
+        model = shap_bundle["model"]
+        feats = shap_bundle["features"]
+
+        shap_vals = shap.TreeExplainer(model).shap_values(feats.iloc[:2000])
+        importance = (pd.Series(abs(shap_vals).mean(axis=0), index=feats.columns)
+                        .sort_values(ascending=False))
+        top_features = importance.index.tolist()[:top_k]
+
+        cats = ["brand", "product_type", "manufacturer", "has_aplus"]
+        raw_keep = []
+        for f in top_features:
+            parent = next((c for c in cats if f == c or f.startswith(c + "_")), f)
+            raw_keep.append(parent)
+        raw_keep = list(dict.fromkeys(raw_keep))        
+        print(f"[bbox] top {top_k} one-hot features -> {len(raw_keep)} raw cols: {raw_keep}")
+
+        bbox_data = pd.read_csv(self.BBOX_path)
+        Y = (bbox_data["buybox_pct"] / 100.0).clip(0.0, 1.0)
+        X = bbox_data[[c for c in raw_keep if c in bbox_data.columns]].copy()
+        cat_in_X = [c for c in cats if c in X.columns]
+        for c in cat_in_X:
+            X[c] = X[c].astype("category")
+        cat_mask = [c in cat_in_X for c in X.columns]
+
+        X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.4, random_state=0)
+        best_tuned = HistGradientBoostingRegressor(
+            max_iter=200, learning_rate=0.08, max_leaf_nodes=31,
+            min_samples_leaf=10, l2_regularization=0.5,
+            categorical_features=cat_mask, random_state=0,
+        )
+        
+        best_tuned.fit(X_train, Y_train)
+        self._BUYBOX_MODEL = best_tuned
+        self._BUYBOX_FEATURES = list(X.columns)
+        self._BUYBOX_CAT_COLS = cat_in_X
+        self._BUYBOX_CAT_LEVELS = {c: list(X[c].cat.categories) for c in cat_in_X}
+        self._BUYBOX_X_test = X_test
+        self._BUYBOX_Y_test = Y_test
+
+        joblib.dump({
+            "model": self._BUYBOX_MODEL,
+            "features": self._BUYBOX_FEATURES,
+            "cat_cols": self._BUYBOX_CAT_COLS,
+            "cat_levels": self._BUYBOX_CAT_LEVELS,
+        }, self._BUYBOX_MODEL_PATH)
+
+        print(f"[bbox] refit on {X.shape[1]} raw cols -> holdout R^2 = {best_tuned.score(X_test, Y_test):.3f}")
+        print(f"[bbox] saved tuned model -> {self._BUYBOX_MODEL_PATH}")
+        return X_test, Y_test, self._BUYBOX_MODEL
+
+    def _eval_out_path(self, filename):
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bbox_eval")
+        os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, filename)
+
+    def plot_predicted_vs_actual(self, path=None):
+        """Held-out predicted vs actual buy-box share, from fit_buybox()'s test split."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        model = self._load_buybox_model()
+
+        Y_test = self._BUYBOX_Y_test
+        Y_pred = model.predict(self._BUYBOX_X_test)
+        r2 = r2_score(Y_test, Y_pred)
+        mae = mean_absolute_error(Y_test, Y_pred)
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.scatter(Y_test, Y_pred, alpha=0.4, s=12)
+        ax.plot([0, 1], [0, 1], "--", color="gray", lw=1, label="perfect")
+        ax.set_xlabel("Actual buy-box share")
+        ax.set_ylabel("Predicted buy-box share")
+        ax.set_title(f"Buy-box prediction -- R2={r2:.3f}, MAE={mae:.3f}")
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+
+        path = path or self._eval_out_path("predicted_vs_actual.png")
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"[bbox-eval] predicted_vs_actual -> {path}")
+        return path
+
+    def plot_residuals(self, path=None):
+        model = self._load_buybox_model()
+
+        Y_test = self._BUYBOX_Y_test
+        Y_pred = model.predict(self._BUYBOX_X_test)
+        residual = Y_pred - Y_test
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        axes[0].scatter(Y_test, residual, alpha=0.4, s=12)
+        axes[0].axhline(0, color="gray", ls="--", lw=1)
+        axes[0].set_xlabel("Actual buy-box share")
+        axes[0].set_ylabel("Residual (pred - actual)")
+        axes[0].set_title("Residual vs actual")
+
+        axes[1].hist(residual, bins=30, color="steelblue", edgecolor="black", alpha=0.8)
+        axes[1].axvline(0, color="gray", ls="--", lw=1)
+        axes[1].set_xlabel("Residual (pred - actual)")
+        axes[1].set_title(f"Residual distribution (mean={residual.mean():+.3f})")
+        fig.tight_layout()
+
+        path = path or self._eval_out_path("residuals.png")
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"[bbox-eval] residuals -> {path}")
+        return path
+
+    def plot_shap_summary(self, top_n=20, sample=2000, path=None):
+
+        shap_bundle = self._load_shap_model()
+        model = shap_bundle["model"]
+        feats = shap_bundle["features"].iloc[:sample]
+
+        shap_vals = shap.TreeExplainer(model).shap_values(feats)
+        mean_abs = pd.Series(np.abs(shap_vals).mean(axis=0), index=feats.columns)
+        
+        importance_pct = (mean_abs / mean_abs.sum() * 100).sort_values(ascending=False)
+        top = importance_pct.head(top_n)
+
+        fig, ax = plt.subplots(figsize=(8, max(4, 0.35 * len(top))))
+        top.iloc[::-1].plot.barh(ax=ax, color="steelblue")
+        for i, v in enumerate(top.iloc[::-1]):
+            ax.text(v, i, f" {v:.1f}%", va="center", fontsize=8)
+        ax.set_xlim(0, top.max() * 1.15)
+        ax.set_xlabel("% of total SHAP importance")
+        ax.set_title(f"Top {len(top)} buy-box features ({top.sum():.0f}% of total importance)")
+        fig.tight_layout()
+
+        path = path or self._eval_out_path("shap_importance.png")
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"[bbox-eval] shap_importance -> {path}")
+        return path
+
+    def evaluate_bbox(self):
+        """Run the full evaluation suite and return {name: saved_path}."""
+        return {
+            "predicted_vs_actual": self.plot_predicted_vs_actual(),
+            "residuals": self.plot_residuals(),
+            "shap_importance": self.plot_shap_summary(),
+        }
+
+
+    def _buybox_panel(self):
+        if self._BUYBOX_PANEL_DF is None:
+            self._BUYBOX_PANEL_DF = pd.read_csv(self.BBOX_path)
+        return self._BUYBOX_PANEL_DF
+
+    def _snapshot_buybox_features(self, asin):
+  
+        if self._BUYBOX_FEATURES is None:
+            return None
+
+        panel = self._buybox_panel()
+        rows = panel[panel["asin"].astype(str) == str(asin)] if "asin" in panel.columns else panel.iloc[0:0]
+
+        cat_cols = self._BUYBOX_CAT_COLS or []
+        snap = {}
+        for col in self._BUYBOX_FEATURES:
+            if rows.empty or col not in panel.columns:
+                snap[col] = np.nan
+            elif col in cat_cols:
+                m = rows[col].mode(dropna=True)
+                snap[col] = m.iloc[0] if not m.empty else np.nan
+            else:
+                snap[col] = float(pd.to_numeric(rows[col], errors="coerce").median())
+        return snap

@@ -258,6 +258,7 @@ def main(granularity=1, lookback_days=45):
         except Exception:
             print(f"[{search_term}] failed, skipping")
             traceback.print_exc()
+            
 
 
 if __name__ == "__main__":

@@ -183,6 +183,27 @@ class Normalizer:
         # two-level -> the feature (level 1); flat -> the column name
         return str(col[1]) if isinstance(col, tuple) else str(col)
 
+    @staticmethod
+    def _nunique(series):
+        '''nunique() that tolerates unhashable cells.
+
+        Upstream extraction can leave list-valued cells in a column that still
+        reads as numeric (str([1, 2]) -> "[1, 2]" parses to a number), and
+        pandas' nunique() raises on unhashable values. Fall back to counting
+        unique string forms, which is exact enough for the near-unique
+        identifier heuristic this feeds.
+        '''
+        try:
+            return series.nunique()
+        except TypeError:
+            def _hashable(v):
+                try:
+                    hash(v)
+                    return v
+                except TypeError:
+                    return repr(v)
+            return series.map(_hashable).nunique()
+
     def _group_columns(self, df):
         '''feature key -> list of dataframe columns contributing to it (sorted).'''
         groups = {}
@@ -220,12 +241,15 @@ class Normalizer:
             pooled = pd.Series(df[cols].to_numpy().ravel())
             if self._detect_numeric(pooled, feature_types, key):
                 # a near-unique numeric column is a key (id/serial/barcode), not a
-                # measurable quantity: scaling it is meaningless, so pass it through
-                # (only when the type was auto-detected, never over an explicit verdict)
-                uniq_ratio = pooled.nunique() / n_rows if n_rows else 0.0
-                if key not in (feature_types or {}) and uniq_ratio >= self.id_uniq_ratio:
-                    self.params_[key] = {"type": "identifier", "center": None, "scale": None}
-                    continue
+                # measurable quantity: scaling it is meaningless, so pass it through.
+                # Only when the type was auto-detected, never over an explicit
+                # verdict -- so the uniqueness count is skipped entirely (and never
+                # touches possibly-unhashable cells) when a verdict is present.
+                if key not in (feature_types or {}) and n_rows:
+                    uniq_ratio = self._nunique(pooled) / n_rows
+                    if uniq_ratio >= self.id_uniq_ratio:
+                        self.params_[key] = {"type": "identifier", "center": None, "scale": None}
+                        continue
                 center, scale = _robust_params(parse_numeric(pooled), self.method)
                 self.params_[key] = {"type": "numeric", "center": center, "scale": scale}
             else:

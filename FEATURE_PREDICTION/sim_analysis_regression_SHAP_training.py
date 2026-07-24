@@ -129,7 +129,7 @@ def predict_models(vn, all_data, search_term, test_size=0.3, random_state=0, n_s
 
     return trained
 
-    
+     
 
 def find_k_res(vn):
     
