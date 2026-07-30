@@ -168,7 +168,9 @@ def attach_real_identifiers(data, id_col=("clean", "asin_ean_id")):
         print(f"[attach_real_identifiers] {id_col} not in frame; skipping")
         return data
 
-    ids = pd.to_numeric(data[id_col], errors="coerce").astype("Int64")
+    # round() before Int64: a scaler upstream can leave this column as
+    # non-integer floats, and astype("Int64") refuses a non-equivalent cast.
+    ids = pd.to_numeric(data[id_col], errors="coerce").round().astype("Int64")
     uniq = [int(i) for i in ids.dropna().unique()]
     if not uniq:
         print("[attach_real_identifiers] no numeric ids to resolve; skipping")
@@ -214,8 +216,9 @@ def process_search_term(search_term, granularity, time_frame, tfe):
     feature_types = load_type_cache(type_cache) if os.path.exists(type_cache) else None
     merged_data = Normalizer().fit_transform(merged_data, feature_types=feature_types)
 
-    # Resolve internal asin_ean_id -> real ASIN/EAN so the saved file can join to
-    # the SP-API DB. Done AFTER normalize so the identifier strings stay intact.
+    # asin_ean_id is in the Normalizer's NEVER_NORMALIZE set, so the raw id
+    # survives here. Resolve it to a real ASIN/EAN so the saved file can join to
+    # the SP-API DB.
     merged_data = attach_real_identifiers(merged_data)
 
     out_path = f"data_files/all_feature_data_{slug}.csv"
@@ -223,7 +226,7 @@ def process_search_term(search_term, granularity, time_frame, tfe):
     print(f"[{search_term}] saved -> {out_path}")
 
 
-def main(granularity=1, lookback_days=45):
+def main(granularity=1, lookback_days=90):
     """
     granularity: which Segmentation_level (1/2/3) to pull distinct search terms
     from and to resolve keyword_ids with. This is the one knob meant to be

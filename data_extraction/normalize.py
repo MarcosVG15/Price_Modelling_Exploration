@@ -167,6 +167,16 @@ class Normalizer:
         norm.save("data_files/normalizer_<term>.json") # reuse on the next batch
     '''
 
+    # Keys / metadata that are never measurable quantities: identifiers, dates,
+    # page numbers, URLs, titles. Scaling these turns an id/url/date into a
+    # meaningless float (and can silently break the DB join key), so they are
+    # always passed through raw -- this overrides any type verdict and any
+    # auto-detection. Add a column name here to protect it.
+    NEVER_NORMALIZE = frozenset({
+        "product_id", "asin_ean_id", "keyword_id", "market_id",
+        "day", "page", "delivery_time", "image_url", "title",
+    })
+
     def __init__(self, method="robust", numeric_min_frac=0.90, min_non_null=5,
                  id_uniq_ratio=0.98):
         self.method = method
@@ -233,6 +243,10 @@ class Normalizer:
 
         n_rows = len(df)
         for key, cols in self._group_columns(df).items():
+            # hardcoded keys/metadata: never scale, whatever the verdict says
+            if key in self.NEVER_NORMALIZE:
+                self.params_[key] = {"type": "identifier", "center": None, "scale": None}
+                continue
             # explicit identifier verdict from the pipeline's typer: pass through
             if feature_types is not None and feature_types.get(key) == "identifier":
                 self.params_[key] = {"type": "identifier", "center": None, "scale": None}
@@ -268,6 +282,8 @@ class Normalizer:
 
         out = df.copy()
         for key, cols in self._group_columns(df).items():
+            if key in self.NEVER_NORMALIZE:
+                continue  # raw value already present in out = df.copy()
             spec = self.params_.get(key)
             if spec is None:  # feature unseen at fit time: detect and scale locally
                 pooled = pd.Series(df[cols].to_numpy().ravel())

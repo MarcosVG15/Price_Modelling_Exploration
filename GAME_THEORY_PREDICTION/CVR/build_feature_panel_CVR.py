@@ -10,8 +10,21 @@ Price   = implied own price = ordered_product_sales / units_ordered, straight fr
 Leakage note: units / sessions / revenue are kept in the output for inspection/weighting,
 but they are the target's ingredients -- DO NOT feed them as features to the CVR GBT.
 
-Run:  python GAME_THEORY_PREDICTION/build_feature_panel.py
-Out:  GAME_THEORY_PREDICTION/demand_feature_panel.csv
+Scrape fold-in: also folds in a curated slice of the scraped market-intelligence CSVs
+(data_files/all_feature_data_{Audio,Computer_SmartMedia,Connectivity}.csv) for the subset
+of ASINs that bridge directly (EAN is NOT a reliable cross-DB bridge -- see memory
+ean-not-a-cross-marketplace-bridge -- so only direct ASIN matches are used; most rows will
+still be NaN here, same sparsity pattern as the BBOX panel's competitor columns). Deliberately
+NOT included: the ttf_/btf_ spec attribute columns (brand/model/manufacturer, ~118 mostly-empty
+multilingual variants) and paragraph_N blocks -- too much volume for too little relevance.
+  - scrape_price/rank/page/delivery_days/number_of_reviews/average_rating: genuinely
+    time-varying -> exact (asin, marketplace, week) match only.
+  - scrape_title + title stylistic-quality scores: semi-static -> nearest-by-date fill per
+    (asin, marketplace) when the exact week has no scrape row, so a slowly-changing field
+    isn't left null just because the scrape didn't happen to run that exact week.
+
+Run:  python GAME_THEORY_PREDICTION/CVR/build_feature_panel_CVR.py
+Out:  GAME_THEORY_PREDICTION/CVR/cvr_feature_panel.csv
 """
 import os, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.dirname(HERE)
@@ -19,6 +32,110 @@ sys.path.insert(0, ROOT); sys.path.insert(0, HERE)
 import pandas as pd
 from sqlalchemy import text
 from market_env import _api_engine
+
+# scrape DB `market.id` -> SP-API `marketplace_id`, cross-verified 2026-07-30 against both
+# the scrape DB's `market` table (id/country/market_place_id) and the actual marketplace_ids
+# seen in sales_traffic_daily -- exact 1:1 match. market_place_id=2 (id=7, nl/Bol) has no
+# SP-API equivalent and is excluded (market_id < 7 filter, see memory market-id-bol-filter).
+SCRAPE_MARKET_TO_MARKETPLACE = {
+    1: "A1PA6795UKMFR9",   # de
+    2: "APJ6JRA9NG5V4",    # it
+    3: "A13V1IB3VIYZZH",   # fr
+    4: "AMEN7PMS3EDWL",    # com.be
+    5: "A1RKKUPIHCS9HS",   # es
+    6: "A1805IZSGTT6HS",   # nl
+}
+SCRAPE_TERMS = ["Audio", "Computer_SmartMedia", "Connectivity"]
+
+
+def _load_scrape_features(tracked_asins):
+    """Load the standardized all_feature_data_<term>.csv files (2-row MultiIndex header),
+    keep only rows for `tracked_asins`, map market_id -> marketplace_id, and pull the
+    curated column set (see module docstring). Deliberately NOT included: the ttf_/btf_
+    spec attribute columns (brand/model/manufacturer) and paragraph_N blocks -- too much
+    volume for too little relevance here. Returns long-format frame: asin, marketplace_id,
+    day, scrape_price, scrape_rank, scrape_page, scrape_delivery_days,
+    scrape_number_of_reviews, scrape_average_rating, scrape_title, plus one column per
+    title stylistic-quality score."""
+    data_files_dir = os.path.join(os.path.dirname(ROOT), "data_files")
+    frames = []
+    for term in SCRAPE_TERMS:
+        path = os.path.join(data_files_dir, f"all_feature_data_{term}.csv")
+        if not os.path.exists(path):
+            print(f"[cvr-scrape] {path} not found, skipping")
+            continue
+        raw = pd.read_csv(path, header=[0, 1], low_memory=False)
+        clean = raw["clean"]
+
+        keep = pd.DataFrame({
+            "asin": clean["asin"].astype(str),
+            "market_id": pd.to_numeric(clean["market_id"], errors="coerce"),
+            "day": pd.to_datetime(clean["day"], errors="coerce"),
+            "scrape_price": pd.to_numeric(clean.get("price"), errors="coerce"),
+            "scrape_rank": pd.to_numeric(clean.get("rank"), errors="coerce"),
+            "scrape_page": pd.to_numeric(clean.get("page"), errors="coerce"),
+            # all four below are genuinely time-varying (delivery_time changes across scrapes
+            # for 97% of ASINs) -- exact-week match, not nearest-fill. scrape_delivery_days
+            # replaces the SP-API avg_delivery_days column, which is 100% NULL at the source.
+            "scrape_delivery_days": pd.to_numeric(clean.get("delivery_time"), errors="coerce"),
+            "scrape_number_of_reviews": pd.to_numeric(clean.get("number_of_reviews"), errors="coerce"),
+            "scrape_average_rating": pd.to_numeric(clean.get("average_rating"), errors="coerce"),
+            "scrape_title": clean.get("title"),
+        })
+        keep = keep[keep["asin"].isin(tracked_asins)]
+        if keep.empty:
+            continue
+
+        if "title" in raw.columns.get_level_values(0):
+            for feat in raw["title"].columns:
+                keep[f"title_{feat}"] = raw.loc[keep.index, ("title", feat)]
+
+        keep = keep.dropna(subset=["asin", "market_id", "day"])
+        keep = keep[keep["market_id"] < 7]                      # Amazon only, never Bol
+        keep["marketplace_id"] = keep["market_id"].map(SCRAPE_MARKET_TO_MARKETPLACE)
+        keep = keep.dropna(subset=["marketplace_id"]).drop(columns=["market_id"])
+        frames.append(keep)
+        print(f"[cvr-scrape] {term}: {len(keep):,} rows matched tracked ASINs")
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _fold_in_scrape_features(df, scrape):
+    """df: the SQL-built CVR panel (has asin, marketplace_id, week). scrape: output of
+    _load_scrape_features. Exact-week match for time-varying cols, nearest-date fill
+    (per asin+marketplace) for the semi-static ones. No-op if scrape is empty."""
+    if scrape.empty:
+        return df
+
+    df = df.copy()
+    df["week"] = pd.to_datetime(df["week"]).astype("datetime64[ns]")
+    scrape = scrape.copy()
+    scrape["day"] = scrape["day"].astype("datetime64[ns]")
+    static_cols = [c for c in scrape.columns if c.startswith("title_") or c == "scrape_title"]
+    exact_cols = ["scrape_price", "scrape_rank", "scrape_page", "scrape_delivery_days",
+                  "scrape_number_of_reviews", "scrape_average_rating"]
+
+    # exact (asin, marketplace, week) match -- genuinely time-varying signals only
+    scrape_wk = scrape.copy()
+    scrape_wk["week"] = scrape_wk["day"].dt.to_period("W-SUN").apply(lambda p: p.start_time).astype("datetime64[ns]")
+    exact = (scrape_wk.groupby(["asin", "marketplace_id", "week"])[exact_cols]
+                       .mean().reset_index())
+    df = df.merge(exact, on=["asin", "marketplace_id", "week"], how="left")
+
+    # nearest-by-date fill -- semi-static product attributes shouldn't go null just
+    # because the scrape didn't land on that exact week
+    keys = df[["asin", "marketplace_id", "week"]].drop_duplicates().sort_values("week")
+    nearest_src = scrape[["asin", "marketplace_id", "day"] + static_cols].sort_values("day")
+    nearest = pd.merge_asof(keys, nearest_src, left_on="week", right_on="day",
+                             by=["asin", "marketplace_id"], direction="nearest")
+    df = df.merge(nearest.drop(columns=["day"]), on=["asin", "marketplace_id", "week"], how="left")
+
+    matched_asins = scrape["asin"].nunique()
+    print(f"[cvr-scrape] folded in {len(static_cols)} static + {len(exact_cols)} exact-match "
+          f"cols for {matched_asins} bridged ASINs")
+    return df
 
 SQL = """
 WITH st AS (   -- spine: CVR target + implied price + Tier-1 traffic, weekly per asin/mkt
@@ -146,6 +263,9 @@ def main():
                      .transform(lambda s: s.ffill().bfill()))
     df["price_vs_lowest"] = df["price"] / df["lowest_price"].replace(0, pd.NA)
 
+    scrape = _load_scrape_features(set(df["asin"].unique()))
+    df = _fold_in_scrape_features(df, scrape)
+
     print(f"panel shape: {df.shape[0]:,} rows x {df.shape[1]} cols")
     print(f"weeks: {df['week'].min()} -> {df['week'].max()}   asins: {df['asin'].nunique()}")
     print("\nprice coverage by source:")
@@ -157,7 +277,7 @@ def main():
     cov = (df.notna().mean().sort_values(ascending=False) * 100).round(1)
     for name, pct in cov.items():
         print(f"   {name:<26} {pct:5.1f}%")
-    out = os.path.join(HERE, "sp_api_demand_forcast_data_CVR.csv")
+    out = os.path.join(HERE, "cvr_feature_panel.csv")
     df.to_csv(out, index=False)
     print(f"\nsaved -> {out}")
 

@@ -12,8 +12,10 @@ The three brains live here: consumer (logit), buy-box (gate), competitor (plugga
 
 
 import os
+import sys
 import json
 import shap
+import joblib
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +27,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import train_test_split
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "CVR"))
+from train_cvr_two_stage import create_cvr_two_stage_predictor  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "BBOX"))
+from train_bbox import create_bbox_predictor  # noqa: E402
 
 
 PRICE_COL = ("clean", "price")
@@ -38,6 +46,13 @@ BBOX_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 CVR_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "CVR", "cvr_feature_panel.csv")
+
+CVR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CVR")
+BBOX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BBOX")
+BBOX_MODEL_PATH = os.path.join(BBOX_DIR, "bbox_model.joblib")
+# two-stage CVR predictor (see train_cvr_two_stage.py): P(cvr>0) classifier x E[cvr|cvr>0] regressor
+CVR_CLF_MODEL_PATH = os.path.join(CVR_DIR, "cvr_clf_model.joblib")
+CVR_REG_MODEL_PATH = os.path.join(CVR_DIR, "cvr_reg_model.joblib")
 
 def _price_scale(path=PARAMS_PATH):
     blob = json.loads(Path(path).read_text())
@@ -59,34 +74,28 @@ def _api_engine():
 class MarketEnv:
 
     _CACHE = {}
-    _BUYBOX_SHAP_MODEL = None
-    _CVR_SHAP_MODEL  = None
-    _BUYBOX_MODEL = None
+
+    # Two-stage CVR model state, shared across all instances/clusters -- see
+    # _load_or_fit_cvr_two_stage_model(). predict_cvr() rebuilds its input row against each
+    # stage's own trained feature/cat schema, never hardcoded column names.
+    # _CVR_MODEL is kept as a "is a CVR model ready" flag for game.py/backtest.py's status
+    # checks (MarketEnv._CVR_MODEL is not None) -- it mirrors _CVR_REG_MODEL, not a model
+    # used for prediction directly; predict_cvr() always goes through clf x reg below.
     _CVR_MODEL = None
+    _CVR_CLF_MODEL = None
+    _CVR_CLF_FEATURES = None
+    _CVR_CLF_CAT_COLS = None
+    _CVR_CLF_CAT_LEVELS = None
+    _CVR_REG_MODEL = None
+    _CVR_REG_FEATURES = None
+    _CVR_REG_CAT_COLS = None
+    _CVR_REG_CAT_LEVELS = None
 
-    # Trained CVR schema, captured in fit_cvr(): the exact ordered feature list the
-    # SHAP pass selected and the subset that must be `category` dtype at predict time.
-    # predict_cvr rebuilds its input row against these -- never hardcode column names.
-    _CVR_FEATURES = None
-    _CVR_CAT_COLS = None
-    _CVR_CAT_LEVELS = None        # {cat_col: fitted categories} -> align predict-time codes
-    _CVR_PANEL_DF = None          # cached CVR panel (avoids re-reading the CSV per reset)
-
-    # Trained BUY-BOX schema, captured in fit_buybox() -- same contract as the CVR
-    # trio. The panel model has NO competitor-price feature (that data was too sparse),
-    # so _buybox_prob modulates its output by the price gap vs the cluster peers.
+    # buy-box model state, shared across all instances/clusters -- see _load_or_fit_buybox_model().
+    _BUYBOX_MODEL = None
     _BUYBOX_FEATURES = None
     _BUYBOX_CAT_COLS = None
     _BUYBOX_CAT_LEVELS = None
-    _BUYBOX_PANEL_DF = None        # cached buy-box panel
-
-    # Features overwritten at predict time by the pricing action / clock. Everything
-    # else in the trained schema is a static product attribute taken from the snapshot.
-    _CVR_DYNAMIC = {"price", "price_vs_lowest", "lowest_price", "bb_price",
-                    "listing_price", "raw_price", "implied_price",
-                    "week_of_year", "month"}
-
-
 
     #  most of these methods are used to provide an estimate of a product that was never here before so we can have a basis on where to start.
     @classmethod
@@ -223,41 +232,97 @@ class MarketEnv:
         self._buybox_feat_snapshot = self._snapshot_buybox_features(asin)
         return self._cvr_feat_snapshot
 
+    @classmethod
+    def _load_or_fit_cvr_two_stage_model(cls):
+        """Two-stage CVR predictor (train_cvr_two_stage.py): P(cvr>0) classifier x
+        E[cvr | cvr>0] regressor. Checks both joblib files first, loads if present;
+        fits both (create_cvr_two_stage_predictor.fit_two_stage()) if either is missing."""
+        if cls._CVR_CLF_MODEL is not None and cls._CVR_REG_MODEL is not None:
+            return cls._CVR_CLF_MODEL, cls._CVR_REG_MODEL
+
+        if os.path.exists(CVR_CLF_MODEL_PATH) and os.path.exists(CVR_REG_MODEL_PATH):
+            print(f"[market_env] loaded cached two-stage CVR models -> "
+                  f"{CVR_CLF_MODEL_PATH}, {CVR_REG_MODEL_PATH}")
+        else:
+            print("[market_env] no cached two-stage CVR models -- fitting now")
+            predictor = create_cvr_two_stage_predictor(cvs_folder_path=CVR_DIR, seg_level=None,
+                                                         seg_terms=[], bbox_predictor_path=BBOX_MODEL_PATH)
+            predictor.fit_two_stage()
+
+        clf_bundle = joblib.load(CVR_CLF_MODEL_PATH)
+        reg_bundle = joblib.load(CVR_REG_MODEL_PATH)
+        cls._CVR_CLF_MODEL = clf_bundle["model"]
+        cls._CVR_CLF_FEATURES = clf_bundle["features"]
+        cls._CVR_CLF_CAT_COLS = clf_bundle["cat_cols"]
+        cls._CVR_CLF_CAT_LEVELS = clf_bundle["cat_levels"]
+        cls._CVR_REG_MODEL = reg_bundle["model"]
+        cls._CVR_REG_FEATURES = reg_bundle["features"]
+        cls._CVR_REG_CAT_COLS = reg_bundle["cat_cols"]
+        cls._CVR_REG_CAT_LEVELS = reg_bundle["cat_levels"]
+        cls._CVR_MODEL = cls._CVR_REG_MODEL   # "is a CVR model ready" flag for game.py/backtest.py
+        return cls._CVR_CLF_MODEL, cls._CVR_REG_MODEL
+
     def predict_cvr(self, own_price, buybox_pred, comp_ref=None, week=None):
 
-        if self._CVR_MODEL is None:
-            self.fit_cvr()
+        if self._CVR_CLF_MODEL is None or self._CVR_REG_MODEL is None:
+            self._load_or_fit_cvr_two_stage_model()
 
         if comp_ref is None:
             comp_ref = self._competitor_reference()
         if week is None:
             week = ((getattr(self, "start_week", 1) - 1 + getattr(self, "t", 0)) % 52) + 1
 
-
-        snap = getattr(self, "_cvr_feat_snapshot", None)
-        row = dict(snap) if snap else {f: np.nan for f in self._CVR_FEATURES}
-
         month = int(min(12, max(1, int((int(week) - 1) // 4.345) + 1)))
         dyn = {
             "price": float(own_price),
-            "buybox_pct": float(buybox_pred) * 100.0,
             "listing_price": float(own_price),
             "bb_price": float(comp_ref) if comp_ref else np.nan,
             "week_of_year": float(week),
             "month": float(month),
-            "buybox_pct" : buybox_pred
+            "buybox_pct": float(buybox_pred) * 100.0,
+            "buybox_pred": float(buybox_pred),   # the chained BBOX prediction -- top feature for both stages
         }
-        for k, v in dyn.items():
-            if k in row:                    
-                row[k] = v
 
-        X_df = pd.DataFrame([row])[self._CVR_FEATURES]      # enforce trained column order
-        levels = self._CVR_CAT_LEVELS or {}
-        for c in (self._CVR_CAT_COLS or []):                # rebuild with the fitted levels
-            X_df[c] = pd.Categorical(X_df[c], categories=levels.get(c))
+        snap = getattr(self, "_cvr_feat_snapshot", None)
 
-        return float(np.clip(self._CVR_MODEL.predict(X_df)[0], 0.0, 1.0))
+        def build_X(features, cat_cols, cat_levels):
+            row = dict(snap) if snap else {f: np.nan for f in features}
+            for k, v in dyn.items():
+                if k in row:
+                    row[k] = v
+            X_df = pd.DataFrame([row])[features]        # enforce trained column order
+            levels = cat_levels or {}
+            for c in (cat_cols or []):                   # rebuild with the fitted levels
+                X_df[c] = pd.Categorical(X_df[c], categories=levels.get(c))
+            return X_df
+
+        X_clf = build_X(self._CVR_CLF_FEATURES, self._CVR_CLF_CAT_COLS, self._CVR_CLF_CAT_LEVELS)
+        X_reg = build_X(self._CVR_REG_FEATURES, self._CVR_REG_CAT_COLS, self._CVR_REG_CAT_LEVELS)
+
+        p_nonzero = float(self._CVR_CLF_MODEL.predict_proba(X_clf)[0, 1])
+        magnitude = float(self._CVR_REG_MODEL.predict(X_reg)[0])
+        return float(np.clip(p_nonzero * magnitude, 0.0, 1.0))
     
+    @classmethod
+    def _load_or_fit_buybox_model(cls):
+
+        if cls._BUYBOX_MODEL is not None:
+            return cls._BUYBOX_MODEL
+
+        if os.path.exists(BBOX_MODEL_PATH):
+            print(f"[market_env] loaded cached buy-box model -> {BBOX_MODEL_PATH}")
+        else:
+            print(f"[market_env] no cached buy-box model at {BBOX_MODEL_PATH} -- fitting one now")
+            predictor = create_bbox_predictor(cvs_folder_path=BBOX_DIR, seg_level=None, seg_terms=[])
+            predictor.fit_buybox()
+
+        bundle = joblib.load(BBOX_MODEL_PATH)
+        cls._BUYBOX_MODEL = bundle["model"]
+        cls._BUYBOX_FEATURES = bundle["features"]
+        cls._BUYBOX_CAT_COLS = bundle["cat_cols"]
+        cls._BUYBOX_CAT_LEVELS = bundle["cat_levels"]
+        return cls._BUYBOX_MODEL
+
     def _buybox_prob(self, own_price, comp_ref=None, week=None):
 
         if comp_ref is None:
@@ -265,7 +330,7 @@ class MarketEnv:
 
 
         if self._BUYBOX_MODEL is None:
-            self.fit_buybox()
+            self._load_or_fit_buybox_model()
 
 
         gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0

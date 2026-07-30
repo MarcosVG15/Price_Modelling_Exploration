@@ -8,7 +8,7 @@ import pandas as pd
 
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error, roc_auc_score
 
 import matplotlib
 matplotlib.use("Agg")
@@ -43,9 +43,12 @@ for the commax product we will for each period stored in the csv we will predict
 class create_bbox_predictor : 
 
     #  this method needs to know the location of the path that contains all of the csv that will be used to train the cvr predictor
-    def __init__(self , cvs_folder_path , seg_level, seg_terms):
+    #  lookback_days: None = use the full panel history; otherwise only weeks within that many days
+    #  of the panel's latest week are used (e.g. 21 to match the ~3-week competitor/stock snapshot window).
+    def __init__(self , cvs_folder_path , seg_level, seg_terms, lookback_days=None):
         self.folder_path = cvs_folder_path
         self.seg_level = seg_level
+        self.lookback_days = lookback_days
 
         self.aggregate_data = None
 
@@ -70,6 +73,22 @@ class create_bbox_predictor :
         self._BUYBOX_Y_test = None
 
         self._BUYBOX_PANEL_DF = None
+
+
+    def _read_panel(self):
+        """Load bbox_feature_panel.csv, optionally clipped to the last `self.lookback_days`
+        days (relative to the panel's own latest week) -- use this to train/evaluate on just
+        the recent window where the competitor/stock/rank snapshot columns actually have data,
+        instead of the full 2-year history where they're near-empty."""
+        panel = pd.read_csv(self.BBOX_path)
+        if self.lookback_days is None:
+            return panel
+        week = pd.to_datetime(panel["week"])
+        cutoff = week.max() - pd.Timedelta(days=self.lookback_days)
+        panel = panel[week >= cutoff].reset_index(drop=True)
+        print(f"[bbox] lookback_days={self.lookback_days} -> {len(panel):,} rows "
+              f"(weeks {week[week >= cutoff].min().date()} -> {week.max().date()})")
+        return panel
 
 
     def get_model_shap(self):
@@ -132,12 +151,12 @@ class create_bbox_predictor :
                 self._BUYBOX_CAT_COLS = bundle["cat_cols"]
                 self._BUYBOX_CAT_LEVELS = bundle["cat_levels"]
 
-                bbox_data = pd.read_csv(self.BBOX_path)
+                bbox_data = self._read_panel()
                 Y = (bbox_data["buybox_pct"] / 100.0).clip(0.0, 1.0)
                 X = bbox_data[[c for c in self._BUYBOX_FEATURES if c in bbox_data.columns]].copy()
                 for c in self._BUYBOX_CAT_COLS:
                     X[c] = X[c].astype("category")
-                _, X_test, _, Y_test = train_test_split(X, Y, test_size=0.4, random_state=0)
+                _, X_test, _, Y_test = train_test_split(X, Y, test_size=0.3, random_state=0)
                 self._BUYBOX_X_test = X_test
                 self._BUYBOX_Y_test = Y_test
                 return self._BUYBOX_MODEL
@@ -151,7 +170,7 @@ class create_bbox_predictor :
             raise FileNotFoundError(
                 f"buy-box feature panel not found: {self.BBOX_path}\n"
                 f"Run `python GAME_THEORY_PREDICTION/BBOX/build_feature_panel_BBox.py` first.")
-        shap_data = pd.read_csv(self.BBOX_path)
+        shap_data = self._read_panel()
 
         drop_columns = [
             "asin", "marketplace_id", "week", "buybox_pct",
@@ -167,7 +186,7 @@ class create_bbox_predictor :
         X = X.drop(columns=sparse)
         cat_cols = [c for c in ["brand", "product_type", "manufacturer", "has_aplus"]
                     if c in X.columns]
-        
+
         X = pd.get_dummies(X, columns=cat_cols, drop_first=True).astype(float)
         print(f"[shap-bbox] {X.shape[1]} features; dropped {len(sparse)} near-empty cols: {sparse}")
 
@@ -199,7 +218,7 @@ class create_bbox_predictor :
         raw_keep = list(dict.fromkeys(raw_keep))        
         print(f"[bbox] top {top_k} one-hot features -> {len(raw_keep)} raw cols: {raw_keep}")
 
-        bbox_data = pd.read_csv(self.BBOX_path)
+        bbox_data = self._read_panel()
         Y = (bbox_data["buybox_pct"] / 100.0).clip(0.0, 1.0)
         X = bbox_data[[c for c in raw_keep if c in bbox_data.columns]].copy()
         cat_in_X = [c for c in cats if c in X.columns]
@@ -229,7 +248,18 @@ class create_bbox_predictor :
             "cat_levels": self._BUYBOX_CAT_LEVELS,
         }, self._BUYBOX_MODEL_PATH)
 
-        print(f"[bbox] refit on {X.shape[1]} raw cols -> holdout R^2 = {best_tuned.score(X_test, Y_test):.3f}")
+        preds = best_tuned.predict(X_test)
+        r2 = r2_score(Y_test, preds)
+        mse = mean_squared_error(Y_test, preds)
+        mae = mean_absolute_error(Y_test, preds)
+        try:
+            # ROC-AUC needs a binary label -- "won majority of the buy-box that week" (>=0.5)
+            auc = roc_auc_score((Y_test >= 0.5).astype(int), preds)
+        except ValueError:
+            auc = float("nan")   # holdout had only one class
+
+        print(f"[bbox] refit on {X.shape[1]} raw cols -> holdout R^2={r2:.3f}  MSE={mse:.3f}  "
+              f"MAE={mae:.3f}  ROC-AUC={auc:.3f}")
         print(f"[bbox] saved tuned model -> {self._BUYBOX_MODEL_PATH}")
         return X_test, Y_test, self._BUYBOX_MODEL
 
@@ -352,3 +382,19 @@ class create_bbox_predictor :
             else:
                 snap[col] = float(pd.to_numeric(rows[col], errors="coerce").median())
         return snap
+
+
+if __name__ == "__main__":
+    import sys
+
+    # optional CLI arg: how many days back (from the panel's latest week) to train/evaluate on.
+    # omit for the full 2-year history; pass e.g. 21 to match the competitor/stock snapshot window.
+    lookback_days = 370
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    predictor = create_bbox_predictor(cvs_folder_path=HERE, seg_level=None, seg_terms=[],
+                                       lookback_days=lookback_days)
+    predictor.reset_models()   # cached joblib models are trained on the old panel schema -- force a refit
+    predictor.fit_buybox()
+    for name, path in predictor.evaluate_bbox().items():
+        print(f"{name}: {path}")
