@@ -149,6 +149,13 @@ class PPO(Agent):
 
         self.buffer = []                                # rollout — cleared each iteration
 
+    def state_dict(self):
+        return {"actor": self.actor.state_dict(), "critic": self.critic.state_dict()}
+
+    def load_state_dict(self, sd):
+        self.actor.load_state_dict(sd["actor"])
+        self.critic.load_state_dict(sd["critic"])
+
     def choose(self, state, explore=True):
         s = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():

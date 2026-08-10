@@ -349,12 +349,54 @@ class create_bbox_predictor :
         print(f"[bbox-eval] shap_importance -> {path}")
         return path
 
+    BBOX_DIST_BINS = 50
+
+    def plot_bbox_distribution(self, data=None, label="", path=None):
+        """Distribution of the buy-box target across data points. Unlike CVR (zero-
+        inflated, mass piled at one end), buy-box share is BIMODAL: heavy mass at both
+        0 (lost the buy-box every session that week) and 1 (won it every session) --
+        see the vertical stripes at 0/1 in predicted_vs_actual.png. Doesn't need a
+        fitted model, just the raw panel (or a filtered one, via `data`)."""
+        panel = data if data is not None else self._buybox_panel()
+        y = (panel["buybox_pct"] / 100.0).clip(0.0, 1.0).dropna()
+        frac_zero = (y == 0).mean()
+        frac_one = (y == 1).mean()
+        edges = np.linspace(0.0, 1.0, self.BBOX_DIST_BINS + 1)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        counts = [(y == 0).sum(), ((y > 0) & (y < 1)).sum(), (y == 1).sum()]
+        axes[0].bar(["== 0 (always lost)", "0 < x < 1 (mixed)", "== 1 (always won)"], counts,
+                    color=["indianred", "steelblue", "seagreen"], edgecolor="black")
+        for i, v in enumerate(counts):
+            axes[0].text(i, v, f" {v:,}\n({v/len(y)*100:.1f}%)", ha="center", va="bottom")
+        axes[0].set_ylim(0, max(counts) * 1.15)
+        axes[0].set_ylabel("data point count")
+        axes[0].set_title("Always-lost vs mixed vs always-won weeks")
+
+        axes[1].hist(y, bins=edges, color="steelblue", edgecolor="black", alpha=0.85)
+        axes[1].set_yscale("log")
+        axes[1].set_xlabel("Buy-box share")
+        axes[1].set_ylabel("data point count (log scale)")
+        axes[1].set_title(f"Full buy-box distribution ({self.BBOX_DIST_BINS} bins)")
+        prefix = f"{label} -- " if label else ""
+        fig.suptitle(f"{prefix}Buy-box distribution across {len(y):,} data points -- "
+                     f"{frac_zero*100:.1f}% always lost, {frac_one*100:.1f}% always won")
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+        default_name = f"bbox_distribution_{label.lower()}.png" if label else "bbox_distribution.png"
+        path = path or self._eval_out_path(default_name)
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"[bbox-eval] bbox_distribution{'_' + label.lower() if label else ''} -> {path}")
+        return path
+
     def evaluate_bbox(self):
         """Run the full evaluation suite and return {name: saved_path}."""
         return {
             "predicted_vs_actual": self.plot_predicted_vs_actual(),
             "residuals": self.plot_residuals(),
             "shap_importance": self.plot_shap_summary(),
+            "bbox_distribution": self.plot_bbox_distribution(),
         }
 
 

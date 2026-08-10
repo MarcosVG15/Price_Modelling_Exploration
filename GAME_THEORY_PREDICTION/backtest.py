@@ -372,7 +372,7 @@ def main():
 
     asin = pick_backtest_target(vn, override)
     cluster_id = cluster_of_asin(vn, asin)
-    env = MarketEnv.for_cluster(vn, cluster_id)   # triggers/loads the global CVR model
+    env = MarketEnv.for_cluster(vn, cluster_id, target_asin=asin)   # triggers/loads the global CVR model
     print(f"[backtest] ASIN={asin}  cluster={cluster_id}  "
           f"reference_price={env.params.get('reference_price'):.2f}  "
           f"CVR_model={'fitted' if MarketEnv._CVR_MODEL is not None else 'CONSTANT 0.03 fallback'}")
@@ -407,7 +407,7 @@ def main2():
     vn, _ = build_vn()
     asin = pick_backtest_target(vn, override)
     cluster_id = cluster_of_asin(vn, asin)
-    env = MarketEnv.for_cluster(vn, cluster_id)   # triggers/loads the global CVR model
+    env = MarketEnv.for_cluster(vn, cluster_id, target_asin=asin)   # triggers/loads the global CVR model
     X_test, Y_test, bbox_model  = MarketEnv.fit_cvr()
     output = bbox_model.predict(X_test)
 

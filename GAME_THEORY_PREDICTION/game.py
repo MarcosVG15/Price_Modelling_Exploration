@@ -18,7 +18,10 @@ class pricing_game:
         q = int(fit.new_product_indices[0])
         self.cluster_id = int(fit.product_labels[q])
         self.competitor_strategy = competitor_strategy
-        self.env = MarketEnv.for_cluster(vn, self.cluster_id, strategy=competitor_strategy)
+        target_asin = (target_product[("clean", "asin")].iloc[0]
+                       if ("clean", "asin") in target_product.columns else None)
+        self.env = MarketEnv.for_cluster(vn, self.cluster_id, strategy=competitor_strategy,
+                                         target_asin=target_asin)
         self.vn = vn
 
 
@@ -114,6 +117,159 @@ class pricing_game:
             pbar.set_postfix(**postfix)
         return self.history
 
+    def train_curriculum(self, promo_episodes=3000, rl_rounds=6, episodes_per_round=500,
+                          rl_lr=1e-4, rl_entropy_coef=0.01, eval_every=50, eval_week=1,
+                          eval_seed=0, checkpoint_path=None):
+        """Two-phase curriculum for a more stable RL-vs-RL pricing policy.
+
+        Phase 1: train PPO to convergence against the stationary 'promo_cycler'
+        competitor (plain train()) -- a clean single-agent problem.
+
+        Phase 2: switch to competitor_strategy='RL' and warm-start BOTH sides from
+        the phase-1 checkpoint (they play the identical game, so starting from the
+        same competent baseline avoids one side crushing a naive opponent). Train
+        via alternating best-response rounds -- one side frozen (greedy, no
+        learning) while the other trains -- instead of naive simultaneous
+        self-play, which is what actually destabilizes multi-agent PPO: each round
+        is single-agent PPO against a stationary target, so neither side ever
+        faces a genuinely moving one. Progress is checked every round against the
+        fixed promo_cycler benchmark, not just the live opponent, since self-play's
+        own reward can look healthy while both sides are cycling into a jointly
+        worse equilibrium.
+        """
+        print(f"[curriculum] Phase 1: {promo_episodes} episodes vs promo_cycler")
+        self.competitor_strategy = "promo_cycler"
+        self.env.competitor_agent = None
+        self.train(episodes=promo_episodes, type='PPO', eval_every=eval_every,
+                   eval_week=eval_week, eval_seed=eval_seed)
+        phase1_history = list(self.history)
+        phase1_eval = list(self.eval_history)
+
+        checkpoint = self.agent.state_dict()
+        if checkpoint_path:
+            import os
+            os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+            torch.save(checkpoint, checkpoint_path)
+            print(f"[curriculum] saved phase-1 checkpoint -> {checkpoint_path}")
+
+        print(f"[curriculum] Phase 2: {rl_rounds} rounds x {episodes_per_round} episodes "
+              f"vs RL, warm-started from phase-1 policy")
+        self.competitor_strategy = "RL"
+
+        main_agent = PPO(state_dim=self.env.state_dim, action_dim=self.env.action_dim,
+                          lr=rl_lr, entropy_coef=rl_entropy_coef)
+        comp_agent = PPO(state_dim=self.env.state_dim, action_dim=self.env.action_dim,
+                          lr=rl_lr, entropy_coef=rl_entropy_coef)
+        main_agent.load_state_dict(checkpoint)
+        comp_agent.load_state_dict(checkpoint)
+        self.agent = main_agent
+        self.env.competitor_agent = comp_agent
+
+        self.selfplay_history = {"main": [], "comp": [], "benchmark_eval": []}
+
+        for round_idx in range(rl_rounds):
+            # Round A: main agent learns, competitor frozen (greedy, stationary target)
+            self.env.competitor_learning = False
+            pbar = tqdm(range(episodes_per_round),
+                        desc=f"round {round_idx + 1}/{rl_rounds} [main learns]", unit="ep")
+            for _ in pbar:
+                start_week = int(self.rng.integers(1, 53))
+                state = self.env.reset(self.target, start_week=start_week, competitor_strategy="RL")
+                done, total = False, 0.0
+                while not done:
+                    a = main_agent.choose(state)
+                    nxt, r, done = self.env.step(a)
+                    main_agent.observe(state, a, r, nxt, done)
+                    state = nxt
+                    total += r
+                main_agent.on_episode_end()
+                self.selfplay_history["main"].append(total)
+                pbar.set_postfix(avg=f"{np.mean(self.selfplay_history['main'][-50:]):.1f}")
+
+            # Round B: competitor learns (via env.step()'s internal observe()), main frozen greedy
+            self.env.competitor_learning = True
+            pbar = tqdm(range(episodes_per_round),
+                        desc=f"round {round_idx + 1}/{rl_rounds} [comp learns]", unit="ep")
+            for _ in pbar:
+                start_week = int(self.rng.integers(1, 53))
+                state = self.env.reset(self.target, start_week=start_week, competitor_strategy="RL")
+                done, comp_total = False, 0.0
+                while not done:
+                    a = main_agent.choose(state, explore=False)
+                    _, _, done = self.env.step(a)
+                    comp_total += self.env.last_comp_profit
+                self.selfplay_history["comp"].append(comp_total)
+                pbar.set_postfix(avg=f"{np.mean(self.selfplay_history['comp'][-50:]):.1f}")
+
+            # Benchmark eval: greedy main agent vs the FIXED promo_cycler, not the live opponent
+            self.agent = main_agent
+            prior_strategy = self.competitor_strategy
+            self.competitor_strategy = "promo_cycler"
+            rng_state = self.env.rng
+            bench = self.best_policy(start_week=eval_week, seed=eval_seed)
+            self.env.rng = rng_state
+            self.competitor_strategy = prior_strategy
+            self.selfplay_history["benchmark_eval"].append((round_idx + 1, bench["total_profit"]))
+            print(f"[curriculum] round {round_idx + 1}/{rl_rounds}: "
+                  f"main avg reward={np.mean(self.selfplay_history['main'][-episodes_per_round:]):.1f}  "
+                  f"benchmark vs promo_cycler={bench['total_profit']:.1f}")
+
+        self.agent = main_agent
+        self.env.competitor_agent = comp_agent
+        self.env.competitor_learning = True
+        self.competitor_strategy = "RL"
+        return {"phase1_history": phase1_history, "phase1_eval": phase1_eval,
+                "selfplay_history": self.selfplay_history}
+
+    def _curriculum_path(self):
+        import os
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cumulative_reward")
+        os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, f"curriculum_cluster{self.cluster_id}.png")
+
+    def plot_curriculum(self, result, path=None):
+        """Plot the two-phase curriculum: phase-1 promo_cycler learning curve, phase-2
+        self-play main-agent learning curve, and the benchmark-vs-promo_cycler eval
+        trend across self-play rounds -- the metric that actually tells you whether
+        self-play is converging or just cycling.
+        """
+        import matplotlib
+        if path is not None:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 1, figsize=(11, 8))
+
+        p1 = np.asarray(result["phase1_history"], dtype=float)
+        axes[0].plot(np.arange(1, len(p1) + 1), p1, lw=0.8, alpha=0.3,
+                     label="phase 1 episode return (vs promo_cycler)")
+        if result["phase1_eval"]:
+            ex, ey = zip(*result["phase1_eval"])
+            axes[0].plot(ex, ey, lw=2, color="green", marker="o", ms=3, label="phase 1 greedy eval")
+        sp_main = np.asarray(result["selfplay_history"]["main"], dtype=float)
+        if sp_main.size:
+            offset = len(p1)
+            axes[0].plot(offset + np.arange(1, len(sp_main) + 1), sp_main, lw=0.8, alpha=0.3,
+                         color="steelblue", label="phase 2 main-agent return (self-play rounds)")
+        axes[0].axvline(len(p1), color="black", ls="--", lw=1, label="phase 1 -> phase 2")
+        axes[0].set_ylabel("episode return")
+        axes[0].set_title(f"Curriculum training vs '{self.competitor_strategy}' (cluster {self.cluster_id})")
+        axes[0].legend(loc="best", fontsize=8)
+
+        bench = result["selfplay_history"]["benchmark_eval"]
+        if bench:
+            bx, by = zip(*bench)
+            axes[1].plot(bx, by, lw=2, marker="o", color="darkorange")
+        axes[1].set_xlabel("self-play round")
+        axes[1].set_ylabel("greedy profit vs promo_cycler\n(fixed benchmark)")
+
+        fig.tight_layout()
+        path = path or self._curriculum_path()
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"[game] curriculum plot -> {path}")
+        return path
+
     def _cumreward_path(self):
         """Descriptive PNG path under cumulative_reward/, built from the last
         train() config + competitor/cluster. Same params -> same file (overwrite)."""
@@ -184,21 +340,26 @@ class pricing_game:
         state = self.env.reset(self.target, start_week=start_week, seed=seed,
                                competitor_strategy=self.competitor_strategy)
         done = False
-        prices, multipliers, rewards, buybox, demand, weeks = [], [], [], [], [], []
+        prices, comp_prices, multipliers, rewards = [], [], [], []
+        buybox, cvr, demand, weeks = [], [], [], []
         while not done:
             a = self.agent.choose(state, explore=False)   # greedy: use the trained policy
             state, r, done = self.env.step(a)
             prices.append(self.env.own_price)
+            comp_prices.append(self.env.last_comp_ref)
             multipliers.append(float(self.env.action_grid[a]))
             rewards.append(r)
             buybox.append(float(state[2]))
+            cvr.append(self.env.last_cvr)
             demand.append(self.env.last_units)
             weeks.append(self.env.iso_week)
         return {
             "prices": prices,
+            "comp_prices": comp_prices,
             "multipliers": multipliers,
             "rewards": rewards,
             "buybox": buybox,
+            "cvr": cvr,
             "demand": demand,
             "weeks": weeks,
             "total_profit": float(np.sum(rewards)),
@@ -232,6 +393,48 @@ class pricing_game:
             "weeks": opt["weeks"],
             "total_units": opt["total_units"],
         }
+
+    def _single_run_path(self):
+        import os
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "single_run")
+        os.makedirs(out_dir, exist_ok=True)
+        return os.path.join(out_dir, f"single_run_{self.competitor_strategy}_cluster{self.cluster_id}.png")
+
+    def plot_single_run(self, roll=None, path=None):
+        """One concrete rollout under the trained (greedy) policy: agent vs competitor
+        price, predicted buy-box probability, and predicted CVR, week by week. Lets you
+        sanity-check the whole price -> buy-box -> CVR -> demand chain on a single
+        trace, rather than only the aggregate Monte Carlo bands."""
+        import matplotlib
+        if path is not None:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        roll = roll if roll is not None else self.best_policy()
+        x = np.arange(1, len(roll["prices"]) + 1)
+
+        fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+
+        axes[0].plot(x, roll["prices"], color="steelblue", lw=2, marker="o", ms=3, label="agent price")
+        axes[0].plot(x, roll["comp_prices"], color="darkorange", lw=2, marker="o", ms=3, label="competitor price")
+        axes[0].set_ylabel("price")
+        axes[0].set_title(f"Single run vs '{self.competitor_strategy}' (cluster {self.cluster_id})")
+        axes[0].legend(loc="best", fontsize=8)
+
+        axes[1].plot(x, roll["buybox"], color="seagreen", lw=2, marker="o", ms=3)
+        axes[1].set_ylabel("P(buy-box)")
+        axes[1].set_ylim(-0.05, 1.05)
+
+        axes[2].plot(x, roll["cvr"], color="indianred", lw=2, marker="o", ms=3)
+        axes[2].set_ylabel("predicted CVR")
+        axes[2].set_xlabel("prediction week")
+
+        fig.tight_layout()
+        path = path or self._single_run_path()
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"[game] single_run -> {path}")
+        return path
 
     def monte_carlo(self, n=500, seed0=0, stochastic=True, randomize_week=True):
         

@@ -39,7 +39,7 @@ PRICE_COL = ("clean", "price")
 HORIZON = 52
 ACTION_GRID = [0.90, 0.95, 1.00, 1.05, 1.10]
 PARAMS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "data_files", "all_feature_data_Headphones.params.json")
+                           "data_files", "all_feature_data_Audio.params.json")
 
 BBOX_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "BBOX", "bbox_feature_panel.csv")
@@ -97,16 +97,25 @@ class MarketEnv:
     _BUYBOX_CAT_COLS = None
     _BUYBOX_CAT_LEVELS = None
 
+    # cached panel CSVs (read once, shared across all instances) backing the snapshot
+    # methods below -- these give bind_target_features() a real per-ASIN starting row
+    # instead of an all-NaN one.
+    _CVR_PANEL_DF = None
+    _BUYBOX_PANEL_DF = None
+
     #  most of these methods are used to provide an estimate of a product that was never here before so we can have a basis on where to start.
     @classmethod
-    def for_cluster(cls, vn, cluster_id, strategy="static"):
-        key = int(cluster_id)
+    def for_cluster(cls, vn, cluster_id, strategy="static", target_asin=None):
+        # Cache key includes target_asin: two different target ASINs sharing the same
+        # cluster must each get their OWN comp_prices/reference_price with themselves
+        # excluded, not a shared env fit for whichever target asked first.
+        key = (int(cluster_id), str(target_asin) if target_asin is not None else None)
         if key not in cls._CACHE:
-            cls._CACHE[key] = cls.fit(vn, key, strategy=strategy)
+            cls._CACHE[key] = cls.fit(vn, cluster_id, strategy=strategy, target_asin=target_asin)
         env = cls._CACHE[key]
-        # The env is cached per cluster and may be shared across pricing_game
-        # instances that each want a different competitor. Set the requested
-        # strategy on the (possibly cached) env so the caller always gets theirs.
+        # The env is cached per (cluster, target_asin) and may be shared across
+        # pricing_game instances that each want a different competitor. Set the
+        # requested strategy on the (possibly cached) env so the caller always gets theirs.
         env.competitor_strategy = strategy
         return env
 
@@ -157,9 +166,12 @@ class MarketEnv:
 
 
     @classmethod
-    def fit(cls, vn, cluster_id, strategy="static"):
+    def fit(cls, vn, cluster_id, strategy="static", target_asin=None):
 
-        members = cls._extract_cluster(vn, cluster_id)
+        members = cls._extract_cluster(vn, cluster_id, target_asin=target_asin)
+        if target_asin is not None and members.empty:
+            print(f"[fit] cluster {cluster_id}: excluding target ASIN {target_asin} left "
+                  f"ZERO other members -- reference_price/comp_prices will fall back to defaults")
 
         center, scale = _price_scale()
         comp_norm = pd.to_numeric(members[PRICE_COL], errors="coerce").dropna().to_numpy()
@@ -169,17 +181,17 @@ class MarketEnv:
         params["price_center"] = center
         params["price_scale"] = scale
         params["reference_price"] = float(np.median(comp_prices)) if comp_prices.size else 1.0
-        # params.update(cls._estimate_buybox(members, comp_prices))
-        # params.update(cls._estimate_seasonality())
-        # cls._estimate_conversion_rate()
+        # buy-box/CVR calibration now runs lazily via the real ML models instead (see
+        # _load_or_fit_buybox_model()/_load_or_fit_cvr_two_stage_model()), not here.
 
         nb_dispersion = 1.0
+        seasonal_index = np.ones(52)
         try:
             asins = members[("clean", "asin")].dropna().astype(str).unique().tolist()
             if asins:
                 in_list = ",".join("'" + a.replace("'", "") + "'" for a in asins)
                 wq = text(f"""
-                    SELECT SUM(units_ordered) AS units
+                    SELECT date_trunc('week', data_date)::date AS week, SUM(units_ordered) AS units
                     FROM sales_traffic_daily
                     WHERE asin IN ({in_list})
                     GROUP BY asin, marketplace_id, date_trunc('week', data_date)
@@ -197,21 +209,40 @@ class MarketEnv:
                     print(f"[fit] cluster {cluster_id}: NB dispersion r={nb_dispersion:.2f} "
                           f"from {units.size} product-weeks "
                           f"(weekly units mean={hist_mean:.2f}, var={hist_var:.2f})")
+
+                # seasonal index: average relative demand by week-of-year (1-52), normalized
+                # to mean=1.0 so _seasonal_multiplier() is a pure multiplier on market_size.
+                week_of_year = pd.to_datetime(wk["week"]).dt.isocalendar().week.clip(upper=52)
+                by_week = (pd.to_numeric(wk["units"], errors="coerce").fillna(0.0)
+                             .groupby(week_of_year).mean())
+                if len(by_week) >= 26 and by_week.mean() > 0:   # need at least half the year covered
+                    idx = by_week.reindex(range(1, 53)).fillna(by_week.mean())
+                    seasonal_index = (idx / idx.mean()).to_numpy()
+                    print(f"[fit] cluster {cluster_id}: seasonal index from {len(by_week)}/52 weeks "
+                          f"(min={seasonal_index.min():.2f}, max={seasonal_index.max():.2f})")
         except Exception as e:
-            print(f"[fit] NB dispersion calibration failed ({e}); using r={nb_dispersion}")
+            print(f"[fit] NB dispersion/seasonality calibration failed ({e}); "
+                  f"using r={nb_dispersion}, flat seasonal index")
         params["nb_dispersion"] = float(nb_dispersion)
+        params["seasonal_index"] = seasonal_index
 
         return cls(int(cluster_id), comp_prices, params, strategy=strategy)
 
     @staticmethod
-    def _extract_cluster(vn, cluster_id):
+    def _extract_cluster(vn, cluster_id, target_asin=None):
 
         cluster = []
         for idx, label in enumerate(vn.product_labels) :
             if label == cluster_id :
                 cluster.append(idx)
 
-        return vn.feature_data.iloc[cluster]
+        members = vn.feature_data.iloc[cluster]
+        # The target itself is frequently a member of its own cluster (it's a real row
+        # in the scraped panel, not a synthetic "new" product) -- drop it so comp_prices/
+        # reference_price reflect actual rivals, not the target benchmarked against itself.
+        if target_asin is not None and ("clean", "asin") in members.columns:
+            members = members[members[("clean", "asin")].astype(str) != str(target_asin)]
+        return members
 
 
     @staticmethod
@@ -226,6 +257,54 @@ class MarketEnv:
 
   
    
+    @classmethod
+    def _cvr_panel(cls):
+        if cls._CVR_PANEL_DF is None:
+            cls._CVR_PANEL_DF = pd.read_csv(CVR_path, low_memory=False)
+        return cls._CVR_PANEL_DF
+
+    @classmethod
+    def _buybox_panel(cls):
+        if cls._BUYBOX_PANEL_DF is None:
+            cls._BUYBOX_PANEL_DF = pd.read_csv(BBOX_path, low_memory=False)
+        return cls._BUYBOX_PANEL_DF
+
+    @staticmethod
+    def _snapshot_row(panel, asin, features, cat_cols):
+        """Per-ASIN starting row for predict_cvr()/_buybox_prob(): median of each numeric
+        feature's history, mode of each categorical -- NaN wherever the ASIN/column has no
+        history. build_X()/the dyn-overrides dict then overwrite the live-simulation fields
+        (price, week, buybox_pred, ...) on top of this."""
+        if not features:
+            return None
+        rows = panel[panel["asin"].astype(str) == str(asin)] if "asin" in panel.columns else panel.iloc[0:0]
+        cat_cols = set(cat_cols or [])
+        snap = {}
+        for col in features:
+            if rows.empty or col not in panel.columns:
+                snap[col] = np.nan
+            elif col in cat_cols:
+                m = rows[col].mode(dropna=True)
+                snap[col] = m.iloc[0] if not m.empty else np.nan
+            else:
+                snap[col] = float(pd.to_numeric(rows[col], errors="coerce").median())
+        return snap
+
+    def _snapshot_cvr_features(self, asin):
+        if self._CVR_CLF_MODEL is None or self._CVR_REG_MODEL is None:
+            self._load_or_fit_cvr_two_stage_model()
+        # union of both stages' feature lists -- predict_cvr() builds one shared row dict
+        # and slices out each stage's own columns from it, so it needs every column either
+        # stage might ask for.
+        features = list(dict.fromkeys((self._CVR_CLF_FEATURES or []) + (self._CVR_REG_FEATURES or [])))
+        cat_cols = set(self._CVR_CLF_CAT_COLS or []) | set(self._CVR_REG_CAT_COLS or [])
+        return self._snapshot_row(self._cvr_panel(), asin, features, cat_cols)
+
+    def _snapshot_buybox_features(self, asin):
+        if self._BUYBOX_MODEL is None:
+            self._load_or_fit_buybox_model()
+        return self._snapshot_row(self._buybox_panel(), asin, self._BUYBOX_FEATURES, self._BUYBOX_CAT_COLS)
+
     def bind_target_features(self, asin):
 
         self._cvr_feat_snapshot = self._snapshot_cvr_features(asin)
@@ -301,7 +380,17 @@ class MarketEnv:
 
         p_nonzero = float(self._CVR_CLF_MODEL.predict_proba(X_clf)[0, 1])
         magnitude = float(self._CVR_REG_MODEL.predict(X_reg)[0])
-        return float(np.clip(p_nonzero * magnitude, 0.0, 1.0))
+        cvr = p_nonzero * magnitude
+
+        # Tree models don't extrapolate: priced far above comp_ref (outside anything seen
+        # in training) they plateau at a boundary-leaf value instead of decaying toward 0.
+        # Mirror _buybox_prob()'s gap correction so CVR also collapses on an over-price
+        # gap -- otherwise reward keeps rising with price indefinitely.
+        gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0
+        decay_coef = float(self.params.get("cvr_gap_decay", 4.0))
+        cvr *= float(np.exp(-decay_coef * max(0.0, gap)))
+
+        return float(np.clip(cvr, 0.0, 1.0))
     
     @classmethod
     def _load_or_fit_buybox_model(cls):
@@ -384,6 +473,11 @@ class MarketEnv:
         comp_ref = self._competitor_reference()
         bb_prob = self._buybox_prob(own_price, comp_ref)
         cvr = self.predict_cvr(own_price, bb_prob, comp_ref)
+        # cached for diagnostics (game.py's per-run trace plot) -- mirrors last_units below,
+        # since this is otherwise the only place either prediction is computed per step.
+        self.last_buybox_prob = bb_prob
+        self.last_cvr = cvr
+        self.last_comp_ref = comp_ref
 
 
         return self._sessions() * cvr
