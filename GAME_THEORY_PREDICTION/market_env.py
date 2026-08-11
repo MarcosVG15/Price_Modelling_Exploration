@@ -37,7 +37,7 @@ from train_bbox import create_bbox_predictor  # noqa: E402
 
 PRICE_COL = ("clean", "price")
 HORIZON = 52
-ACTION_GRID = [0.90, 0.95, 1.00, 1.05, 1.10]
+ACTION_GRID = [0.90, 0.925, 0.95, 0.975,1.00, 1.025, 1.05,1.075, 1.10]
 PARAMS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "data_files", "all_feature_data_Audio.params.json")
 
@@ -155,7 +155,8 @@ class MarketEnv:
         self.nb_dispersion = params.get("nb_dispersion", 1.0)
 
         self.competitor_agent = None
-        self.competitor_learning = True   # gate learning/exploration off during greedy eval
+        self.competitor_learning = True   # gate observe()/on_episode_end() -- learn or stay frozen
+        self.competitor_explore = True    # gate sample-vs-greedy -- independent of learning
         self.comp_price = None            # the RL competitor's single scalar price
         self.comp_cost = None
         self._comp_pending = None         # (state, action) the competitor just took, for observe()
@@ -385,10 +386,15 @@ class MarketEnv:
         # Tree models don't extrapolate: priced far above comp_ref (outside anything seen
         # in training) they plateau at a boundary-leaf value instead of decaying toward 0.
         # Mirror _buybox_prob()'s gap correction so CVR also collapses on an over-price
-        # gap -- otherwise reward keeps rising with price indefinitely.
+        # gap -- otherwise reward keeps rising with price indefinitely. Only kick in past
+        # a free zone, though: real (price vs bb_price) gaps in cvr_feature_panel.csv are
+        # tight (median 0%, 90th pct ~6%, 95th pct ~31%) -- applying this from gap=0 was
+        # double-discounting completely ordinary competitive pricing on top of the buy-box
+        # model's own already-steep price sensitivity, not just guarding true extrapolation.
         gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0
+        free_zone = float(self.params.get("cvr_gap_free_zone", 0.4))
         decay_coef = float(self.params.get("cvr_gap_decay", 4.0))
-        cvr *= float(np.exp(-decay_coef * max(0.0, gap)))
+        cvr *= float(np.exp(-decay_coef * max(0.0, gap - free_zone)))
 
         return float(np.clip(cvr, 0.0, 1.0))
     
@@ -561,7 +567,40 @@ class MarketEnv:
         week = ((self.start_week - 1 + t) % 52) + 1
         return self.params["seasonal_index"][week - 1]
 
-   
+    def plot_cvr_seasonality(self, path=None):
+        """Plot predict_cvr()'s week_of_year/month response at a fixed reference
+        price -- price (and therefore buy-box) held constant, so what moves is
+        purely the model's learned seasonal component."""
+        import matplotlib
+        if path is not None:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        ref_price = float(self.params.get("reference_price", 1.0))
+        comp_ref = self._competitor_reference()
+        weeks = np.arange(1, 53)
+        bb = [self._buybox_prob(ref_price, comp_ref, week=int(w)) for w in weeks]
+        cvr = [self.predict_cvr(ref_price, b, comp_ref=comp_ref, week=int(w))
+               for b, w in zip(bb, weeks)]
+
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.plot(weeks, cvr, marker="o", ms=3, lw=1.6, color="#E45756")
+        ax.set_xlabel("ISO week of year")
+        ax.set_ylabel("predicted CVR")
+        ax.set_title(f"Learned CVR seasonality at reference price={ref_price:.2f} "
+                     f"(cluster {self.cluster_id})")
+        fig.tight_layout()
+
+        if path is None:
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CVR")
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"cvr_seasonality_cluster{self.cluster_id}.png")
+        fig.savefig(path, dpi=130)
+        plt.close(fig)
+        print(f"[market_env] CVR seasonality plot -> {path}")
+        return path
+
+
 
     def _competitor_prices(self, strategy_type):
 
@@ -590,7 +629,7 @@ class MarketEnv:
                     print("NO COMPETITOR CHOSEN")
                     return base_prices           # no agent attached yet -> behave like static
                 s_c = self._competitor_state()
-                a = int(self.competitor_agent.choose(s_c, explore=self.competitor_learning))
+                a = int(self.competitor_agent.choose(s_c, explore=self.competitor_explore))
                 self._comp_pending = (s_c, a)    # remember for observe() in step()
                 self.comp_price = float(max(self.comp_price * self.action_grid[a], floor))
                 return np.array([self.comp_price])
@@ -642,12 +681,14 @@ class MarketEnv:
         ], dtype=float)
 
     def _competitor_profit(self, comp_price):
-        """Competitor's per-step profit. The buy-box splits the market: it wins the
-        (1 - our_buybox) share of sessions. CVR reuses our model with the competitor's
-        price (seller-side features are approximated as symmetric)."""
+        """Competitor's per-step profit, mirroring expected_demand(): (1 - our_buybox)
+        is the competitor's own win probability, fed into the CVR model as a feature
+        the same way bb_prob is on the main side -- NOT also applied as an extra
+        multiplier. Doing both double-counted the buy-box effect and made undercutting
+        to the price floor look far more rewarding than it should."""
         bb_us = self._buybox_prob(self.own_price, comp_price)
-        comp_units = self._sessions() * (1.0 - bb_us) * self.predict_cvr(
-            comp_price, 1.0 - bb_us, comp_ref=self.own_price)
+        comp_cvr = self.predict_cvr(comp_price, 1.0 - bb_us, comp_ref=self.own_price)
+        comp_units = self._sessions() * comp_cvr
         return (comp_price - self.comp_cost) * comp_units
 
     # ---- persistence ---------------------------------------------------

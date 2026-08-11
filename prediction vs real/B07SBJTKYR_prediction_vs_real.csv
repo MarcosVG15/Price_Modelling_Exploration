@@ -1,0 +1,3 @@
+week,BE_pred_buybox,BE_pred_units,BE_real_buybox,BE_real_units,DE_pred_buybox,DE_pred_units,DE_real_buybox,DE_real_units,ES_pred_buybox,ES_pred_units,ES_real_buybox,ES_real_units,FR_pred_buybox,FR_pred_units,FR_real_buybox,FR_real_units,IT_pred_buybox,IT_pred_units,IT_real_buybox,IT_real_units,NL_pred_buybox,NL_pred_units,NL_real_buybox,NL_real_units
+2026-W25,0.0,0.0,0.0,0.0,0.0,0.002,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,79.168,0.0,0.0,0.0,68.334,0.0
+2026-W26,0.0,0.0,0.0,0.0,,,,,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,100.0,0.0,0.0,0.0,50.0,0.0

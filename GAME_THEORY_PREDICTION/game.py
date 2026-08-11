@@ -75,7 +75,7 @@ class pricing_game:
 
 
     def train(self, episodes=3000, alpha=0.1, gamma=0.95,  epsilon=1.0, epsilon_min=0.05, decay=0.999,
-              type='PPO', eval_every=50, eval_week=1, eval_seed=0):
+              type='PPO', eval_every=50, eval_week=1, eval_seed=0, stochastic=True):
         self.history = []
         self.eval_history = []       # (episode, greedy_return) -- clean policy-quality checkpoints
         # Remember the run's key params so plot_cumulative_reward() can name the file.
@@ -84,42 +84,53 @@ class pricing_game:
         pbar = tqdm(range(episodes), desc=f"training {type}", unit="ep")
         self.agent = self.choose_agent(type)
 
-        for i in pbar:
-            start_week = int(self.rng.integers(1, 53))
-            state = self.env.reset(self.target, start_week=start_week, competitor_strategy=self.competitor_strategy)
-            done = False
-            total = 0.0
-            while not done:
-                a = self.agent.choose(state)
-                nxt, r, done = self.env.step(a)
-                self.agent.observe(state , a , r , nxt , done)
-                state = nxt
-                total += r
+        try:
+            # Train against noisy (Negative-Binomial) demand, not just its deterministic
+            # mean -- otherwise the policy overfits to one exact demand curve per start-week
+            # instead of learning pricing that's robust to real-world demand variance.
+            self.env.stochastic = stochastic
+            for i in pbar:
+                start_week = int(self.rng.integers(1, 53))
+                state = self.env.reset(self.target, start_week=start_week, competitor_strategy=self.competitor_strategy)
+                done = False
+                total = 0.0
+                while not done:
+                    a = self.agent.choose(state)
+                    nxt, r, done = self.env.step(a)
+                    self.agent.observe(state , a , r , nxt , done)
+                    state = nxt
+                    total += r
 
-            self.agent.on_episode_end()                  # anneal exploration (TQL/DQN ε; no-op for PPO)
-            self.history.append(total)
+                self.agent.on_episode_end()                  # anneal exploration (TQL/DQN ε; no-op for PPO)
+                self.history.append(total)
 
-            # Periodic GREEDY eval: roll out the CURRENT policy with NO exploration on a
-            # FIXED week/seed, so the only thing changing between checkpoints is the policy
-            # itself. best_policy() never calls observe(), so it can't perturb learning.
-            if (i + 1) % eval_every == 0:
-                rng_state = self.env.rng                 # keep the training RNG stream intact ...
-                greedy = self.best_policy(start_week=eval_week, seed=eval_seed)
-                self.env.rng = rng_state                 # ... (the eval ran on its own seeded stream)
-                self.eval_history.append((i + 1, greedy["total_profit"]))
+                # Periodic GREEDY eval: roll out the CURRENT policy with NO exploration on a
+                # FIXED week/seed, so the only thing changing between checkpoints is the policy
+                # itself. best_policy() never calls observe(), so it can't perturb learning.
+                # Always deterministic (stochastic=False) so checkpoints stay comparable to
+                # each other, independent of the training demand noise.
+                if (i + 1) % eval_every == 0:
+                    rng_state = self.env.rng                 # keep the training RNG stream intact ...
+                    self.env.stochastic = False
+                    greedy = self.best_policy(start_week=eval_week, seed=eval_seed)
+                    self.env.stochastic = stochastic
+                    self.env.rng = rng_state                 # ... (the eval ran on its own seeded stream)
+                    self.eval_history.append((i + 1, greedy["total_profit"]))
 
-            postfix = {"avg_reward": f"{np.mean(self.history[-50:]):.1f}"}
-            if self.eval_history:
-                postfix["greedy"] = f"{self.eval_history[-1][1]:.0f}"
-            eps = getattr(self.agent, "epsilon", None)   # PPO has no ε -> omit it from the bar
-            if eps is not None:
-                postfix["eps"] = f"{eps:.3f}"
-            pbar.set_postfix(**postfix)
+                postfix = {"avg_reward": f"{np.mean(self.history[-50:]):.1f}"}
+                if self.eval_history:
+                    postfix["greedy"] = f"{self.eval_history[-1][1]:.0f}"
+                eps = getattr(self.agent, "epsilon", None)   # PPO has no ε -> omit it from the bar
+                if eps is not None:
+                    postfix["eps"] = f"{eps:.3f}"
+                pbar.set_postfix(**postfix)
+        finally:
+            self.env.stochastic = False   # never leave the shared/cached env in stochastic mode
         return self.history
 
     def train_curriculum(self, promo_episodes=3000, rl_rounds=6, episodes_per_round=500,
                           rl_lr=1e-4, rl_entropy_coef=0.01, eval_every=50, eval_week=1,
-                          eval_seed=0, checkpoint_path=None):
+                          eval_seed=0, checkpoint_path=None, stochastic=True):
         """Two-phase curriculum for a more stable RL-vs-RL pricing policy.
 
         Phase 1: train PPO to convergence against the stationary 'promo_cycler'
@@ -141,7 +152,7 @@ class pricing_game:
         self.competitor_strategy = "promo_cycler"
         self.env.competitor_agent = None
         self.train(episodes=promo_episodes, type='PPO', eval_every=eval_every,
-                   eval_week=eval_week, eval_seed=eval_seed)
+                   eval_week=eval_week, eval_seed=eval_seed, stochastic=stochastic)
         phase1_history = list(self.history)
         phase1_eval = list(self.eval_history)
 
@@ -167,56 +178,77 @@ class pricing_game:
 
         self.selfplay_history = {"main": [], "comp": [], "benchmark_eval": []}
 
-        for round_idx in range(rl_rounds):
-            # Round A: main agent learns, competitor frozen (greedy, stationary target)
-            self.env.competitor_learning = False
-            pbar = tqdm(range(episodes_per_round),
-                        desc=f"round {round_idx + 1}/{rl_rounds} [main learns]", unit="ep")
-            for _ in pbar:
-                start_week = int(self.rng.integers(1, 53))
-                state = self.env.reset(self.target, start_week=start_week, competitor_strategy="RL")
-                done, total = False, 0.0
-                while not done:
-                    a = main_agent.choose(state)
-                    nxt, r, done = self.env.step(a)
-                    main_agent.observe(state, a, r, nxt, done)
-                    state = nxt
-                    total += r
-                main_agent.on_episode_end()
-                self.selfplay_history["main"].append(total)
-                pbar.set_postfix(avg=f"{np.mean(self.selfplay_history['main'][-50:]):.1f}")
+        try:
+            for round_idx in range(rl_rounds):
+                # Round A: main agent learns; competitor is frozen (no observe()/updates) but
+                # still SAMPLES from its current policy rather than playing pure argmax. A fully
+                # deterministic frozen opponent produces the exact same ~52 trajectories (one per
+                # start-week) every episode -- almost no state variety for main_agent to condition
+                # a reaction on. A fixed but still stochastic policy is still a stationary target
+                # for PPO to best-respond to (its action DISTRIBUTION per state isn't changing),
+                # while giving main_agent enough varied opponent behavior to actually learn to
+                # react instead of memorizing one path. Demand noise (stochastic=True) adds a
+                # second source of variety, so the learned response isn't fit to one exact curve.
+                self.env.competitor_learning = False
+                self.env.competitor_explore = True
+                self.env.stochastic = stochastic
+                pbar = tqdm(range(episodes_per_round),
+                            desc=f"round {round_idx + 1}/{rl_rounds} [main learns]", unit="ep")
+                for _ in pbar:
+                    start_week = int(self.rng.integers(1, 53))
+                    state = self.env.reset(self.target, start_week=start_week, competitor_strategy="RL")
+                    done, total = False, 0.0
+                    while not done:
+                        a = main_agent.choose(state)
+                        nxt, r, done = self.env.step(a)
+                        main_agent.observe(state, a, r, nxt, done)
+                        state = nxt
+                        total += r
+                    main_agent.on_episode_end()
+                    self.selfplay_history["main"].append(total)
+                    pbar.set_postfix(avg=f"{np.mean(self.selfplay_history['main'][-50:]):.1f}")
 
-            # Round B: competitor learns (via env.step()'s internal observe()), main frozen greedy
-            self.env.competitor_learning = True
-            pbar = tqdm(range(episodes_per_round),
-                        desc=f"round {round_idx + 1}/{rl_rounds} [comp learns]", unit="ep")
-            for _ in pbar:
-                start_week = int(self.rng.integers(1, 53))
-                state = self.env.reset(self.target, start_week=start_week, competitor_strategy="RL")
-                done, comp_total = False, 0.0
-                while not done:
-                    a = main_agent.choose(state, explore=False)
-                    _, _, done = self.env.step(a)
-                    comp_total += self.env.last_comp_profit
-                self.selfplay_history["comp"].append(comp_total)
-                pbar.set_postfix(avg=f"{np.mean(self.selfplay_history['comp'][-50:]):.1f}")
+                # Round B: competitor learns (via env.step()'s internal observe()); main is frozen
+                # (no observe()) but also still explores -- same reasoning mirrored: the competitor
+                # needs to see main_agent vary its price to learn a genuine reaction, not a constant.
+                self.env.competitor_learning = True
+                self.env.competitor_explore = True
+                self.env.stochastic = stochastic
+                pbar = tqdm(range(episodes_per_round),
+                            desc=f"round {round_idx + 1}/{rl_rounds} [comp learns]", unit="ep")
+                for _ in pbar:
+                    start_week = int(self.rng.integers(1, 53))
+                    state = self.env.reset(self.target, start_week=start_week, competitor_strategy="RL")
+                    done, comp_total = False, 0.0
+                    while not done:
+                        a = main_agent.choose(state, explore=True)
+                        _, _, done = self.env.step(a)
+                        comp_total += self.env.last_comp_profit
+                    self.selfplay_history["comp"].append(comp_total)
+                    pbar.set_postfix(avg=f"{np.mean(self.selfplay_history['comp'][-50:]):.1f}")
 
-            # Benchmark eval: greedy main agent vs the FIXED promo_cycler, not the live opponent
-            self.agent = main_agent
-            prior_strategy = self.competitor_strategy
-            self.competitor_strategy = "promo_cycler"
-            rng_state = self.env.rng
-            bench = self.best_policy(start_week=eval_week, seed=eval_seed)
-            self.env.rng = rng_state
-            self.competitor_strategy = prior_strategy
-            self.selfplay_history["benchmark_eval"].append((round_idx + 1, bench["total_profit"]))
-            print(f"[curriculum] round {round_idx + 1}/{rl_rounds}: "
-                  f"main avg reward={np.mean(self.selfplay_history['main'][-episodes_per_round:]):.1f}  "
-                  f"benchmark vs promo_cycler={bench['total_profit']:.1f}")
+                # Benchmark eval: greedy main agent vs the FIXED promo_cycler, not the live
+                # opponent, and always deterministic so rounds stay comparable to each other.
+                self.agent = main_agent
+                prior_strategy = self.competitor_strategy
+                self.competitor_strategy = "promo_cycler"
+                rng_state = self.env.rng
+                self.env.stochastic = False
+                bench = self.best_policy(start_week=eval_week, seed=eval_seed)
+                self.env.stochastic = stochastic
+                self.env.rng = rng_state
+                self.competitor_strategy = prior_strategy
+                self.selfplay_history["benchmark_eval"].append((round_idx + 1, bench["total_profit"]))
+                print(f"[curriculum] round {round_idx + 1}/{rl_rounds}: "
+                      f"main avg reward={np.mean(self.selfplay_history['main'][-episodes_per_round:]):.1f}  "
+                      f"benchmark vs promo_cycler={bench['total_profit']:.1f}")
+        finally:
+            self.env.stochastic = False   # never leave the shared/cached env in stochastic mode
 
         self.agent = main_agent
         self.env.competitor_agent = comp_agent
-        self.env.competitor_learning = True
+        self.env.competitor_learning = False   # greedy for post-training eval, not exploring
+        self.env.competitor_explore = False
         self.competitor_strategy = "RL"
         return {"phase1_history": phase1_history, "phase1_eval": phase1_eval,
                 "selfplay_history": self.selfplay_history}

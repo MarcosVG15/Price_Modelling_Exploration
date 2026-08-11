@@ -1,0 +1,3 @@
+week,BE_pred_buybox,BE_pred_units,BE_real_buybox,BE_real_price,BE_real_units,DE_pred_buybox,DE_pred_units,DE_real_buybox,DE_real_price,DE_real_units,ES_pred_buybox,ES_pred_units,ES_real_buybox,ES_real_price,ES_real_units,FR_pred_buybox,FR_pred_units,FR_real_buybox,FR_real_price,FR_real_units,IT_pred_buybox,IT_pred_units,IT_real_buybox,IT_real_price,IT_real_units,NL_pred_buybox,NL_pred_units,NL_real_buybox,NL_real_price,NL_real_units
+2026-W25,88.517,1.633,0.0,34.99,0.0,88.517,34.033,0.0,34.99,0.0,88.517,2.535,0.0,34.99,0.0,88.517,8.336,25.588,34.99,2.0,88.517,3.781,23.862,34.99,0.0,88.517,2.879,43.246,34.99,0.0
+2026-W26,88.517,0.268,0.0,,0.0,,,,,,88.517,0.268,0.0,,0.0,88.517,0.383,27.27,,0.0,88.517,0.23,40.0,,0.0,88.517,0.345,54.55,,0.0

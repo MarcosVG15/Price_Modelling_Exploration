@@ -61,7 +61,7 @@ def pick_target(data, random_state=2):
     return unique.iloc[[i]]
 
 
-def main():
+def main(stochastic=True):
     print("building vn ")
     # max_rows=28_000 -> large enough to include B09DGN7MRD (row 26,445 in Audio.csv), still
     # safely under the ~30-40k row ceiling where svd_product_communities' dense similarity
@@ -92,8 +92,10 @@ def main():
     # Phase 1: PPO vs the stationary promo_cycler (clean single-agent training).
     # Phase 2: warm-started RL-vs-RL self-play, alternating which side learns each
     # round, checked every round against the fixed promo_cycler benchmark.
-    result = game.train_curriculum(promo_episodes=3000, rl_rounds=6, episodes_per_round=500,
-                                    checkpoint_path=checkpoint_path)
+    print(f"[main] training stochastic={stochastic} "
+          f"({'NB demand noise on' if stochastic else 'deterministic mean demand'})")
+    result = game.train_curriculum(promo_episodes=3000, rl_rounds=4, episodes_per_round=500,
+                                    checkpoint_path=checkpoint_path, stochastic=stochastic)
     curriculum_path = game.plot_curriculum(result)
     print(f"  saved curriculum plot -> {curriculum_path}")
 
@@ -119,4 +121,7 @@ def main():
         print(f"  saved {metric} band -> {out}")
 
 if __name__ == "__main__":
-    main()
+    # Flip to False here to train against the plain expected-value demand curve instead
+    # of NB demand noise -- e.g. to isolate whether the noise itself helps or hurts
+    # convergence.
+    main(stochastic=True)

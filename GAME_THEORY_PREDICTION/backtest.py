@@ -134,6 +134,13 @@ def load_history(asin):
                      real_buybox=("buy_box_percentage", "mean"))
                 .reset_index())
 
+    # Normalise to a 0-100 % scale here, once, so every downstream consumer (both
+    # plots and the CSV table) sees the same units as pred_buybox (which is always
+    # 0-100). Amazon reports 0-100; be robust to a 0-1 fraction should that ever show up.
+    valid_bb = weekly["real_buybox"].dropna()
+    if not valid_bb.empty and valid_bb.max() <= 1.5:
+        weekly["real_buybox"] *= 100.0
+
     # Sessions-report proxy price (revenue / units) -- kept only as a fallback. It's a
     # weekly average that barely moves, which is why the price x buy-box plane was flat.
     weekly["real_price_stx"] = np.where(
@@ -262,35 +269,39 @@ def plot(weekly, asin, cluster_id):
 
 
 def plot_buybox(weekly, asin, cluster_id):
-    """REAL buy-box percentage over time, one line per marketplace -- the weekly
-    average of sales_traffic_daily.buy_box_percentage (Amazon's Featured-Offer %),
-    bucketed by ISO week and split by marketplace_id. NaN weeks (no reported buy-box)
-    are simply gaps in a line."""
+    """Real vs. predicted buy-box % over time, one clean panel per marketplace --
+    small multiples instead of 12 overlapping lines (6 markets x real+predicted) fighting
+    for the same axes, which was unreadable. real_buybox is already 0-100, normalised in
+    load_history(). NaN weeks (no reported buy-box) are simply gaps in a line."""
     bb = weekly.copy()
-    # Normalise to a 0-100 % axis (Amazon reports 0-100; be robust to a 0-1 fraction).
-    valid = bb["real_buybox"].dropna()
-    if not valid.empty and valid.max() <= 1.5:
-        bb["real_buybox"] = bb["real_buybox"] * 100.0
 
     mkts = [m for m in MARKETPLACE_NAMES if m in set(bb["marketplace_id"])]
     mkts += [m for m in bb["marketplace_id"].unique() if m not in MARKETPLACE_NAMES]
 
-    fig, ax = plt.subplots(figsize=(11, 5))
-    for mkt in mkts:
+    n = len(mkts)
+    ncols = min(3, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.2 * nrows), squeeze=False)
+
+    for i, mkt in enumerate(mkts):
+        ax = axes[i // ncols][i % ncols]
         d = bb[bb["marketplace_id"] == mkt].sort_values("data_date")
-        name = MARKETPLACE_NAMES.get(mkt, mkt)
-        line, = ax.plot(d["data_date"], d["real_buybox"], marker="o", ms=3, lw=1.8,
-                        label=f"{name} real")
-        if "pred_buybox" in d:            # model's predicted % (dashed, same colour)
-            ax.plot(d["data_date"], d["pred_buybox"], ls="--", lw=1.4,
-                    color=line.get_color(), label=f"{name} predicted")
-    ax.set_ylim(0, 100)
-    ax.set_xlabel("week")
-    ax.set_ylabel("buy-box % (weekly avg)")
-    ax.set_title(f"Buy-box % — predicted (dashed) vs real (solid) — {asin} (cluster {cluster_id})")
-    ax.tick_params(axis="x", rotation=45, labelsize=8)
-    ax.legend(fontsize=7, loc="best", ncol=2)
-    fig.tight_layout()
+        ax.plot(d["data_date"], d["real_buybox"], color="#4C78A8", marker="o", ms=3,
+                lw=1.8, label="real")
+        if "pred_buybox" in d:
+            ax.plot(d["data_date"], d["pred_buybox"], color="#E45756", ls="--", lw=1.6,
+                    label="predicted")
+        ax.set_ylim(-2, 102)
+        ax.set_ylabel("buy-box %")
+        ax.set_title(MARKETPLACE_NAMES.get(mkt, mkt))
+        ax.tick_params(axis="x", rotation=45, labelsize=8)
+        ax.legend(fontsize=8, loc="best")
+
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].axis("off")
+
+    fig.suptitle(f"Buy-box % — predicted vs real — {asin} (cluster {cluster_id})", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
 
     os.makedirs(OUT_DIR, exist_ok=True)
     png = os.path.join(OUT_DIR, f"{asin}_buybox_evolution.png")
@@ -304,10 +315,7 @@ def plot_buybox_price_plane(weekly, asin, cluster_id):
     connected in time order and coloured by ISO week. Reveals the CO-EVOLUTION -- a path
     that drifts down-and-right means "priced up -> lost the buy-box". Only weeks that sold
     (real price known) place a point. One panel per marketplace with real price movement."""
-    bb = weekly.copy()
-    valid = bb["real_buybox"].dropna()
-    if not valid.empty and valid.max() <= 1.5:
-        bb["real_buybox"] = bb["real_buybox"] * 100.0
+    bb = weekly.copy()      # real_buybox is already 0-100 -- normalised in load_history()
     bb = bb.dropna(subset=["real_price", "real_buybox"])
     # keep only marketplaces with at least 2 distinct prices (a trajectory to see)
     mkts = [m for m in list(MARKETPLACE_NAMES) + list(bb["marketplace_id"].unique())
@@ -346,14 +354,16 @@ def plot_buybox_price_plane(weekly, asin, cluster_id):
 
 
 def save_table(weekly, asin):
-    """Wide table: one block of columns (real_units / pred_units / real_price) per
-    marketplace, indexed by ISO week -- 'a column for each marketplace and the price'."""
+    """Wide table: one block of columns (real_units / pred_units / real_price /
+    real_buybox / pred_buybox, the latter two in 0-100 %) per marketplace, indexed
+    by ISO week -- 'a column for each marketplace and the price'."""
     m = weekly.copy()
     m["mkt"] = m["marketplace_id"].map(lambda x: MARKETPLACE_NAMES.get(x, x))
     m["week"] = m["data_date"].dt.strftime("%G-W%V")
     wide = m.pivot_table(
         index="week", columns="mkt",
-        values=["real_units", "pred_units", "real_price"], aggfunc="first")
+        values=["real_units", "pred_units", "real_price", "real_buybox", "pred_buybox"],
+        aggfunc="first")
     # flatten ('real_units','DE') -> 'DE_real_units'
     wide.columns = [f"{mkt}_{metric}" for metric, mkt in wide.columns]
     wide = wide.reindex(sorted(wide.columns), axis=1)
@@ -373,6 +383,10 @@ def main():
     asin = pick_backtest_target(vn, override)
     cluster_id = cluster_of_asin(vn, asin)
     env = MarketEnv.for_cluster(vn, cluster_id, target_asin=asin)   # triggers/loads the global CVR model
+    # Without this, predict_cvr() has no per-ASIN snapshot to fall back on and every
+    # static feature (brand, product_type, quality, ...) is NaN -- the model then
+    # predicts ~0 CVR for every week, which is why pred_units came out all zero.
+    env.bind_target_features(asin)
     print(f"[backtest] ASIN={asin}  cluster={cluster_id}  "
           f"reference_price={env.params.get('reference_price'):.2f}  "
           f"CVR_model={'fitted' if MarketEnv._CVR_MODEL is not None else 'CONSTANT 0.03 fallback'}")
@@ -428,5 +442,5 @@ def main2():
 
 
 if __name__ == "__main__":
-    # main()
-    main2()
+    main()
+    # main2()

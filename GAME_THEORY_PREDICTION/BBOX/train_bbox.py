@@ -40,7 +40,21 @@ for the commax product we will for each period stored in the csv we will predict
 
 
 
-class create_bbox_predictor : 
+# Economically-required direction for price/cost-like features: a HistGradientBoosting
+# tree has no built-in notion that "pricier than the market -> never a HIGHER chance of
+# winning the buy-box" -- on sparse real data it can and does learn local reversals of
+# that (see e.g. a $20 price increase flipping predicted win probability from 58% to
+# 99.7%). monotonic_cst forces the direction; keyed by name so it survives fit_buybox()'s
+# SHAP top-k selection regardless of which subset of these actually gets picked, and any
+# column not listed here (including all categoricals) stays unconstrained (0).
+MONOTONIC_DIRECTION = {
+    "price": -1, "own_landed": -1, "own_shipping": -1,          # my own price/cost: higher -> never helps
+    "price_vs_lowest": -1, "price_vs_bb": -1, "landed_vs_bb": -1,  # my gap vs the market: wider -> never helps
+    "lowest_price": +1, "min_competitor_landed": +1,             # the floor I have to beat: higher -> never hurts
+}
+
+
+class create_bbox_predictor :
 
     #  this method needs to know the location of the path that contains all of the csv that will be used to train the cvr predictor
     #  lookback_days: None = use the full panel history; otherwise only weeks within that many days
@@ -227,10 +241,11 @@ class create_bbox_predictor :
         cat_mask = [c in cat_in_X for c in X.columns]
 
         X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.4, random_state=0)
+        monotonic_cst = [MONOTONIC_DIRECTION.get(c, 0) for c in X.columns]
         best_tuned = HistGradientBoostingRegressor(
             max_iter=200, learning_rate=0.08, max_leaf_nodes=31,
             min_samples_leaf=10, l2_regularization=0.5,
-            categorical_features=cat_mask, random_state=0,
+            categorical_features=cat_mask, monotonic_cst=monotonic_cst, random_state=0,
         )
         
         best_tuned.fit(X_train, Y_train)

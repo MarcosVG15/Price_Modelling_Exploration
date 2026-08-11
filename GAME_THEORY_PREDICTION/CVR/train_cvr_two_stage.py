@@ -63,6 +63,17 @@ DROP_COLUMNS = [
 ]
 CAT_COLS = ["brand", "product_type", "has_aplus"]
 
+# Same reasoning as BBOX/train_bbox.py's MONOTONIC_DIRECTION: unconstrained trees can (and
+# did -- see the isolated CVR spike at one price point flanked by much lower neighbors)
+# learn a locally non-monotonic price response on sparse real data. buybox_pred is the
+# chained buy-box prediction (top feature for both stages, per market_env.py) -- winning
+# the buy-box more often should never translate to LOWER conversion, so it's constrained
+# positive rather than left alone like price is negative.
+MONOTONIC_DIRECTION = {
+    "price": -1, "price_vs_lowest": -1, "lowest_price": +1,
+    "buybox_pred": +1,
+}
+
 
 def _binary_shap_importance(model, feats):
     """shap.TreeExplainer's return shape for binary classifiers varies by shap/sklearn
@@ -223,10 +234,11 @@ class create_cvr_two_stage_predictor:
         cat_mask = [c in cat_in_X for c in X.columns]
         Y = (panel.loc[train_idx, "cvr"].clip(0.0, 1.0) > 0).astype(int)
 
+        monotonic_cst = [MONOTONIC_DIRECTION.get(c, 0) for c in X.columns]
         clf = HistGradientBoostingClassifier(
             max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
             min_samples_leaf=10, l2_regularization=0.1,
-            categorical_features=cat_mask, random_state=0,
+            categorical_features=cat_mask, monotonic_cst=monotonic_cst, random_state=0,
         )
         clf.fit(X, Y)
         self._CLF_MODEL = clf
@@ -290,10 +302,11 @@ class create_cvr_two_stage_predictor:
         cat_mask = [c in cat_in_X for c in X.columns]
         Y = panel.loc[nz_train_idx, "cvr"].clip(0.0, 1.0)
 
+        monotonic_cst = [MONOTONIC_DIRECTION.get(c, 0) for c in X.columns]
         reg = HistGradientBoostingRegressor(
             max_iter=300, learning_rate=0.03, max_leaf_nodes=31,
             min_samples_leaf=5, l2_regularization=0.05,
-            categorical_features=cat_mask, random_state=0,
+            categorical_features=cat_mask, monotonic_cst=monotonic_cst, random_state=0,
         )
         reg.fit(X, Y)
         self._REG_MODEL = reg
