@@ -1,0 +1,79 @@
+|--- return_rate <= 0.10
+|   |--- return_rate <= 0.03
+|   |   |--- commission_per_unit <= -6.12
+|   |   |   |--- return_rate <= 0.01
+|   |   |   |   |--- est_margin <= 255.65
+|   |   |   |   |   |--- weights: [0.00, 202.00, 7.00] class: MIXED
+|   |   |   |   |--- est_margin >  255.65
+|   |   |   |   |   |--- weights: [3.00, 188.00, 9.00] class: MIXED
+|   |   |   |--- return_rate >  0.01
+|   |   |   |   |--- return_rate <= 0.02
+|   |   |   |   |   |--- weights: [16.00, 716.00, 152.00] class: MIXED
+|   |   |   |   |--- return_rate >  0.02
+|   |   |   |   |   |--- weights: [0.00, 241.00, 5.00] class: MIXED
+|   |   |--- commission_per_unit >  -6.12
+|   |   |   |--- price <= 266.50
+|   |   |   |   |--- image_count <= 112.50
+|   |   |   |   |   |--- weights: [11.00, 140.00, 69.00] class: MIXED
+|   |   |   |   |--- image_count >  112.50
+|   |   |   |   |   |--- weights: [33.00, 145.00, 31.00] class: MIXED
+|   |   |   |--- price >  266.50
+|   |   |   |   |--- weights: [9.00, 215.00, 27.00] class: MIXED
+|   |--- return_rate >  0.03
+|   |   |--- own_landed <= 350.93
+|   |   |   |--- fba_fee_per_unit <= -4.61
+|   |   |   |   |--- image_count <= 105.00
+|   |   |   |   |   |--- weights: [12.00, 218.00, 164.00] class: MIXED
+|   |   |   |   |--- image_count >  105.00
+|   |   |   |   |   |--- weights: [13.00, 148.00, 40.00] class: MIXED
+|   |   |   |--- fba_fee_per_unit >  -4.61
+|   |   |   |   |--- return_rate <= 0.05
+|   |   |   |   |   |--- weights: [27.00, 169.00, 313.00] class: WON
+|   |   |   |   |--- return_rate >  0.05
+|   |   |   |   |   |--- weights: [56.00, 138.00, 100.00] class: MIXED
+|   |   |--- own_landed >  350.93
+|   |   |   |--- commission_per_unit <= -101.19
+|   |   |   |   |--- weights: [19.00, 226.00, 40.00] class: MIXED
+|   |   |   |--- commission_per_unit >  -101.19
+|   |   |   |   |--- weights: [5.00, 235.00, 22.00] class: MIXED
+|--- return_rate >  0.10
+|   |--- image_count <= 127.00
+|   |   |--- fba_fee_per_unit <= -4.53
+|   |   |   |--- commission_per_unit <= -14.92
+|   |   |   |   |--- return_rate <= 0.22
+|   |   |   |   |   |--- weights: [239.00, 695.00, 888.00] class: WON
+|   |   |   |   |--- return_rate >  0.22
+|   |   |   |   |   |--- weights: [56.00, 114.00, 322.00] class: WON
+|   |   |   |--- commission_per_unit >  -14.92
+|   |   |   |   |--- has_aplus <= 0.50
+|   |   |   |   |   |--- weights: [575.00, 955.00, 1174.00] class: WON
+|   |   |   |   |--- has_aplus >  0.50
+|   |   |   |   |   |--- weights: [233.00, 443.00, 240.00] class: MIXED
+|   |   |--- fba_fee_per_unit >  -4.53
+|   |   |   |--- est_margin <= 4.07
+|   |   |   |   |--- image_count <= 114.50
+|   |   |   |   |   |--- weights: [299.00, 107.00, 856.00] class: WON
+|   |   |   |   |--- image_count >  114.50
+|   |   |   |   |   |--- weights: [711.00, 121.00, 402.00] class: LOST
+|   |   |   |--- est_margin >  4.07
+|   |   |   |   |--- price <= 274.00
+|   |   |   |   |   |--- weights: [4369.00, 3979.00, 8739.00] class: WON
+|   |   |   |   |--- price >  274.00
+|   |   |   |   |   |--- weights: [234.00, 564.00, 1342.00] class: WON
+|   |--- image_count >  127.00
+|   |   |--- n_variation_siblings <= 1.50
+|   |   |   |--- fba_fee_per_unit <= -4.02
+|   |   |   |   |--- weights: [7.00, 180.00, 16.00] class: MIXED
+|   |   |   |--- fba_fee_per_unit >  -4.02
+|   |   |   |   |--- own_landed <= 164.49
+|   |   |   |   |   |--- weights: [86.00, 184.00, 76.00] class: MIXED
+|   |   |   |   |--- own_landed >  164.49
+|   |   |   |   |   |--- weights: [14.00, 181.00, 63.00] class: MIXED
+|   |   |--- n_variation_siblings >  1.50
+|   |   |   |--- est_margin <= 163.45
+|   |   |   |   |--- price <= 72.49
+|   |   |   |   |   |--- weights: [142.00, 190.00, 302.00] class: WON
+|   |   |   |   |--- price >  72.49
+|   |   |   |   |   |--- weights: [206.00, 152.00, 137.00] class: LOST
+|   |   |   |--- est_margin >  163.45
+|   |   |   |   |--- weights: [15.00, 147.00, 62.00] class: MIXED

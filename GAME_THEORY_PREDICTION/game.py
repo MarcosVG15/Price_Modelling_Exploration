@@ -48,19 +48,20 @@ class pricing_game:
 
 
 
-    def choose_agent(self , type):
-        
+    def choose_agent(self , type, entropy_coef=0.01):
+
         match type :
             case 'TQL' :
                 tql_agent = TQL(action_dim=self.env.action_dim, low=self.low, high=self.high)
                 return tql_agent
-            
+
             case 'DQN' :
                 dqn_agent = DQN(state_dim=self.env.state_dim, action_dim=self.env.action_dim)
                 return dqn_agent
 
             case 'PPO' :
-                ppo_agent = PPO(state_dim=self.env.state_dim, action_dim=self.env.action_dim)
+                ppo_agent = PPO(state_dim=self.env.state_dim, action_dim=self.env.action_dim,
+                                 entropy_coef=entropy_coef)
                 return ppo_agent
             
             # case 'A2C': 
@@ -75,14 +76,20 @@ class pricing_game:
 
 
     def train(self, episodes=3000, alpha=0.1, gamma=0.95,  epsilon=1.0, epsilon_min=0.05, decay=0.999,
-              type='PPO', eval_every=50, eval_week=1, eval_seed=0, stochastic=True):
+              type='PPO', eval_every=50, eval_week=1, eval_seed=0, stochastic=True, entropy_coef=0.01):
         self.history = []
         self.eval_history = []       # (episode, greedy_return) -- clean policy-quality checkpoints
         # Remember the run's key params so plot_cumulative_reward() can name the file.
         self.train_config = {"agent": type, "episodes": episodes,
                              "gamma": gamma, "epsilon": epsilon, "decay": decay}
         pbar = tqdm(range(episodes), desc=f"training {type}", unit="ep")
-        self.agent = self.choose_agent(type)
+        # entropy_coef=0.01 (PPO's own default is 0.0): phase-1 pretraining is the ONLY
+        # place a fresh PPO actor is built with no entropy floor at all, and it collapsed
+        # to a single argmax action within ~300/3000 episodes on cluster 7091 (greedy eval
+        # went dead flat, then stayed flat through all 4 self-play rounds too, since phase 2
+        # warm-starts from this already-collapsed actor). Matches train_curriculum()'s own
+        # rl_entropy_coef default so phase 1 and phase 2 never fight each other.
+        self.agent = self.choose_agent(type, entropy_coef=entropy_coef)
 
         try:
             # Train against noisy (Negative-Binomial) demand, not just its deterministic
@@ -151,8 +158,14 @@ class pricing_game:
         print(f"[curriculum] Phase 1: {promo_episodes} episodes vs promo_cycler")
         self.competitor_strategy = "promo_cycler"
         self.env.competitor_agent = None
+        # Same rl_entropy_coef as phase 2 below -- phase 1 used to build its PPO actor with
+        # entropy_coef=0.0 (see choose_agent()/train()'s old default), which let it collapse
+        # to a single argmax action long before phase 2 ever starts; phase 2's warm start
+        # then inherits that collapsed, exploration-dead actor no matter what its own
+        # entropy_coef is set to.
         self.train(episodes=promo_episodes, type='PPO', eval_every=eval_every,
-                   eval_week=eval_week, eval_seed=eval_seed, stochastic=stochastic)
+                   eval_week=eval_week, eval_seed=eval_seed, stochastic=stochastic,
+                   entropy_coef=rl_entropy_coef)
         phase1_history = list(self.history)
         phase1_eval = list(self.eval_history)
 

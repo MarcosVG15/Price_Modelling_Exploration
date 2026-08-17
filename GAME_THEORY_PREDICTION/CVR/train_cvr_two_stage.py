@@ -149,6 +149,8 @@ class create_cvr_two_stage_predictor:
 
     def _predict_buybox(self, df):
         bundle = self._load_bbox_bundle()
+        if bundle.get("type") == "manual_rule":
+            return self._predict_buybox_manual_rule(df, bundle["params"])
         model, features = bundle["model"], bundle["features"]
         cat_cols, cat_levels = bundle["cat_cols"], bundle["cat_levels"]
         X = pd.DataFrame(index=df.index)
@@ -157,6 +159,41 @@ class create_cvr_two_stage_predictor:
             X[col] = pd.Categorical(values, categories=cat_levels[col]) if col in cat_cols \
                 else pd.to_numeric(values, errors="coerce")
         return model.predict(X)
+
+    @staticmethod
+    def _predict_buybox_manual_rule(df, params):
+        """Mirrors market_env.py's _buybox_prob() manual-rule branch exactly (same formula,
+        same gap/abs_gap definitions), so the buybox_pred feature CVR trains on matches what
+        the live simulation actually feeds it -- instead of the old fitted tree's prediction,
+        which was fit on a different feature set (own_landed/est_margin/fba_fee_per_unit/...)
+        that mostly doesn't even exist in this panel and came back as near-all-NaN.
+
+        own_price = price (the CVR panel's own per-row listing price, ~93% populated).
+        comp_ref  = bb_price (avg buy-box-landed price that week) -- ~0.2% populated, so gap
+                    falls back to 0.0 wherever it's missing, the SAME convention market_env.py
+                    already uses live (`gap = ... if comp_ref else 0.0`).
+        ref_price = lowest_price (avg lowest-landed price that week), same fallback -- the
+                    closest real per-row analogue to market_env.py's fixed reference_price
+                    anchor, which doesn't exist in this flat (non-clustered) panel.
+        own_fba/own_prime/own_feedback = 1.0/1.0/4.5, the exact simulation-time constants
+        market_env.py hardcodes for every product (see MarketEnv.__init__) -- not re-derived
+        here since the live simulation never varies them either.
+        """
+        own_price = pd.to_numeric(df.get("price"), errors="coerce")
+        comp_ref = pd.to_numeric(df.get("bb_price"), errors="coerce")
+        ref_price = pd.to_numeric(df.get("lowest_price"), errors="coerce")
+
+        gap = ((own_price - comp_ref) / comp_ref).where(comp_ref.notna() & (comp_ref != 0), 0.0)
+        abs_gap = ((own_price - ref_price) / ref_price).where(ref_price.notna() & (ref_price != 0), 0.0)
+
+        own_fba, own_prime, own_feedback = 1.0, 1.0, 4.5
+        z = (params["buybox_intercept"] + params["buybox_gap_coef"] * gap
+             + params["buybox_abs_gap_coef"] * abs_gap
+             + params["buybox_fba_coef"] * own_fba
+             + params["buybox_prime_coef"] * own_prime
+             + params["buybox_feedback_coef"] * own_feedback)
+        z = z.clip(-30.0, 30.0)
+        return (1.0 / (1.0 + np.exp(-z))).to_numpy()
 
     def _load_panel(self):
         if self._PANEL_DF is None:
@@ -432,15 +469,25 @@ class create_cvr_two_stage_predictor:
 if __name__ == "__main__":
     HERE = os.path.dirname(os.path.abspath(__file__))
     BBOX_MODEL_PATH = os.path.join(HERE, "..", "BBOX", "bbox_model.joblib")
-    if not os.path.exists(BBOX_MODEL_PATH):
+    # Same precedence as market_env.py's _buybox_prob(): the hand-authored manual rule
+    # (BBOX/train_bbox_manual_rule.py) takes priority over the old fitted tree whenever it
+    # exists, so CVR is always trained against whichever buy-box mechanism the live
+    # simulation actually uses -- not silently left behind it.
+    BBOX_MANUAL_RULE_PATH = os.path.join(HERE, "..", "BBOX", "bbox_manual_rule.joblib")
+    if os.path.exists(BBOX_MANUAL_RULE_PATH):
+        BBOX_PREDICTOR_PATH = BBOX_MANUAL_RULE_PATH
+    elif os.path.exists(BBOX_MODEL_PATH):
+        BBOX_PREDICTOR_PATH = BBOX_MODEL_PATH
+    else:
         raise FileNotFoundError(
-            f"buy-box predictor not found: {BBOX_MODEL_PATH}\n"
-            f"Run `python GAME_THEORY_PREDICTION/BBOX/train_bbox.py` first -- CVR features "
-            f"include the buy-box model's own prediction (buybox_pred).")
-    print(f"[cvr-2stage] using buy-box predictor -> {BBOX_MODEL_PATH}")
+            f"no buy-box predictor found at {BBOX_MANUAL_RULE_PATH} or {BBOX_MODEL_PATH}\n"
+            f"Run `python GAME_THEORY_PREDICTION/BBOX/train_bbox_manual_rule.py` (or "
+            f"train_bbox.py) first -- CVR features include the buy-box model's own "
+            f"prediction (buybox_pred).")
+    print(f"[cvr-2stage] using buy-box predictor -> {BBOX_PREDICTOR_PATH}")
 
     predictor = create_cvr_two_stage_predictor(cvs_folder_path=HERE, seg_level=None, seg_terms=[],
-                                                bbox_predictor_path=BBOX_MODEL_PATH)
+                                                bbox_predictor_path=BBOX_PREDICTOR_PATH)
     predictor.reset_models()   # cached joblib models may be stale -- force a refit
     predictor.fit_two_stage()
     predictor.evaluate_two_stage()

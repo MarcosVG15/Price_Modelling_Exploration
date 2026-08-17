@@ -50,6 +50,9 @@ CVR_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 CVR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CVR")
 BBOX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BBOX")
 BBOX_MODEL_PATH = os.path.join(BBOX_DIR, "bbox_model.joblib")
+# hand-authored buy-box rule (see BBOX/train_bbox_manual_rule.py) -- _buybox_prob() below
+# uses this INSTEAD OF the fitted tree above whenever this file exists.
+BBOX_MANUAL_RULE_PATH = os.path.join(BBOX_DIR, "bbox_manual_rule.joblib")
 # two-stage CVR predictor (see train_cvr_two_stage.py): P(cvr>0) classifier x E[cvr|cvr>0] regressor
 CVR_CLF_MODEL_PATH = os.path.join(CVR_DIR, "cvr_clf_model.joblib")
 CVR_REG_MODEL_PATH = os.path.join(CVR_DIR, "cvr_reg_model.joblib")
@@ -96,6 +99,10 @@ class MarketEnv:
     _BUYBOX_FEATURES = None
     _BUYBOX_CAT_COLS = None
     _BUYBOX_CAT_LEVELS = None
+
+    # hand-authored buy-box rule (see _load_manual_buybox_rule() / BBOX_MANUAL_RULE_PATH) --
+    # takes priority over _BUYBOX_MODEL above whenever bbox_manual_rule.joblib exists.
+    _BUYBOX_RULE_PARAMS = None
 
     # cached panel CSVs (read once, shared across all instances) backing the snapshot
     # methods below -- these give bind_target_features() a real per-ASIN starting row
@@ -325,8 +332,12 @@ class MarketEnv:
                   f"{CVR_CLF_MODEL_PATH}, {CVR_REG_MODEL_PATH}")
         else:
             print("[market_env] no cached two-stage CVR models -- fitting now")
+            # Same precedence as _buybox_prob() below: train against the manual rule
+            # whenever it exists, so a lazy CVR fit never ends up trained on the OLD fitted
+            # tree's buybox_pred while the live simulation has already moved on to the rule.
+            bbox_path = BBOX_MANUAL_RULE_PATH if os.path.exists(BBOX_MANUAL_RULE_PATH) else BBOX_MODEL_PATH
             predictor = create_cvr_two_stage_predictor(cvs_folder_path=CVR_DIR, seg_level=None,
-                                                         seg_terms=[], bbox_predictor_path=BBOX_MODEL_PATH)
+                                                         seg_terms=[], bbox_predictor_path=bbox_path)
             predictor.fit_two_stage()
 
         clf_bundle = joblib.load(CVR_CLF_MODEL_PATH)
@@ -392,12 +403,57 @@ class MarketEnv:
         # double-discounting completely ordinary competitive pricing on top of the buy-box
         # model's own already-steep price sensitivity, not just guarding true extrapolation.
         gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0
-        free_zone = float(self.params.get("cvr_gap_free_zone", 0.4))
-        decay_coef = float(self.params.get("cvr_gap_decay", 4.0))
+        # 0.4 -> 0.15: raising decay to 8.0 (below) only steepens the penalty PAST the free
+        # zone -- it does nothing to where the zone's boundary sits. At 0.4, both self-play
+        # agents could climb price-vs-reference all the way to 1.4x with literally zero extra
+        # CVR penalty, then hit a cliff -- so they rationally rode the boundary (observed
+        # single-run: agent/comp plateaued at ~325-400, and 233.7*1.4=327 -- almost exactly
+        # the 0.4 free-zone edge). Verified directly against the fitted models: sweeping
+        # free_zone from 0.4 down, the symmetric profit-maximizing price drops 325 -> 285 ->
+        # 245, then STOPS moving at 0.15 (245 again at 0.10 and 0.05) -- 0.15 is the smallest
+        # free zone that still changes the answer, i.e. the point past which something else
+        # (the buy-box rule's own always-on gap penalty) becomes the binding constraint
+        # instead of this free zone.
+        free_zone = float(self.params.get("cvr_gap_free_zone", 0.15))
+        # 4.0 -> 8.0: at the old value, cost being FIXED at episode start (0.6*start price,
+        # never rescaled) meant margin-per-unit grew faster than this decay could cut CVR --
+        # verified against the actual fitted CVR+buybox models on cluster 7091's real
+        # single-run trajectory: price 235->350 raised weekly profit 150->178 at decay=4.0
+        # despite buy-box collapsing 0.90->0.50. decay=8.0 (paired with abs_decay=4.0 below)
+        # was the first setting where that same escalation became unprofitable (178->147,
+        # and the peak state 390 went from breakeven to clearly a loss, 149->87).
+        decay_coef = float(self.params.get("cvr_gap_decay", 8.0))
         cvr *= float(np.exp(-decay_coef * max(0.0, gap - free_zone)))
+
+        # Same blind spot as _buybox_prob(): comp_ref is the rival's own live price under
+        # competitor_strategy="RL", so it moves right along with own_price if both sides
+        # inflate together -- gap stays flat and this decay never fires. reference_price is
+        # the cluster's fitted median, fixed for the whole episode, so it still catches a
+        # joint price runaway that comp_ref-relative gap can't see. Weaker coefficient: a
+        # broad brake, not the primary signal, so it doesn't fight normal competitive moves.
+        ref_price = self.params.get("reference_price")
+        abs_gap = (own_price - ref_price) / ref_price if ref_price else 0.0
+        abs_free_zone = float(self.params.get("cvr_abs_gap_free_zone", 0.15))   # 0.4 -> 0.15, same fix as above
+        abs_decay_coef = float(self.params.get("cvr_abs_gap_decay", 4.0))   # 2.0 -> 4.0, same check as above
+        cvr *= float(np.exp(-abs_decay_coef * max(0.0, abs_gap - abs_free_zone)))
 
         return float(np.clip(cvr, 0.0, 1.0))
     
+    @classmethod
+    def _load_manual_buybox_rule(cls):
+        """Loads BBOX_MANUAL_RULE_PATH once and caches it class-wide, same sharing pattern as
+        _load_or_fit_buybox_model() below. Returns None (not an error) if the file doesn't
+        exist yet -- _buybox_prob() falls back to the fitted tree in that case."""
+        if cls._BUYBOX_RULE_PARAMS is not None:
+            return cls._BUYBOX_RULE_PARAMS
+        if not os.path.exists(BBOX_MANUAL_RULE_PATH):
+            return None
+        bundle = joblib.load(BBOX_MANUAL_RULE_PATH)
+        cls._BUYBOX_RULE_PARAMS = bundle["params"]
+        print(f"[market_env] loaded manual buy-box rule -> {BBOX_MANUAL_RULE_PATH} "
+              f"(params={cls._BUYBOX_RULE_PARAMS})")
+        return cls._BUYBOX_RULE_PARAMS
+
     @classmethod
     def _load_or_fit_buybox_model(cls):
 
@@ -423,14 +479,36 @@ class MarketEnv:
         if comp_ref is None:
             comp_ref = self._competitor_reference()
 
+        gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0
+        # Absolute anchor, independent of whatever the rival is currently doing: comp_ref
+        # moves every step under competitor_strategy="RL" (it's the rival's own live price),
+        # so a purely comp_ref-relative correction can't tell "both sides got expensive
+        # together" from "price is fine" -- gap stays flat either way. reference_price is
+        # the cluster's fitted median, fixed for the whole episode, so this term keeps firing
+        # even when comp_ref has drifted up right alongside own_price.
+        ref_price = self.params.get("reference_price")
+        abs_gap = (own_price - ref_price) / ref_price if ref_price else 0.0
+        if week is None:
+            week = ((getattr(self, "start_week", 1) - 1 + getattr(self, "t", 0)) % 52) + 1
+
+        # --- hand-authored rule (BBOX/train_bbox_manual_rule.py) -- takes priority over the
+        # fitted tree below whenever bbox_manual_rule.joblib exists. See that file's docstring
+        # for why: every fitted attempt on this panel found ~0 marginal price signal, so this
+        # is a stated assumption instead of something re-fit here. Delete/rename the joblib
+        # to fall back to the tree branch further down.
+        rule_params = self._load_manual_buybox_rule()
+        if rule_params is not None:
+            z = (rule_params["buybox_intercept"]
+                 + rule_params["buybox_gap_coef"] * gap
+                 + rule_params["buybox_abs_gap_coef"] * abs_gap
+                 + rule_params["buybox_fba_coef"] * self.own_fba
+                 + rule_params["buybox_prime_coef"] * self.own_prime
+                 + rule_params["buybox_feedback_coef"] * self.own_feedback)
+            z = float(np.clip(z, -30.0, 30.0))
+            return 1.0 / (1.0 + np.exp(-z))
 
         if self._BUYBOX_MODEL is None:
             self._load_or_fit_buybox_model()
-
-
-        gap = (own_price - comp_ref) / comp_ref if comp_ref else 0.0
-        if week is None:
-            week = ((getattr(self, "start_week", 1) - 1 + getattr(self, "t", 0)) % 52) + 1
 
         if self._BUYBOX_MODEL is not None and self._BUYBOX_FEATURES is not None:
             snap = getattr(self, "_buybox_feat_snapshot", None)
@@ -450,15 +528,19 @@ class MarketEnv:
                 X_df[c] = pd.Categorical(X_df[c], categories=levels.get(c))
             base = float(np.clip(self._BUYBOX_MODEL.predict(X_df)[0], 1e-4, 1.0 - 1e-4))
 
-        
+
             coef = float(self.params.get("buybox_gap_coef", -12.0))
-            logit = np.log(base / (1.0 - base)) + coef * gap
+            abs_coef = float(self.params.get("buybox_abs_gap_coef", -4.0))   # weaker: a broad
+            # brake on joint inflation, not the primary competitive signal -- coef stays the
+            # dominant term whenever prices are actually close to their historical anchor.
+            logit = np.log(base / (1.0 - base)) + coef * gap + abs_coef * abs_gap
             logit = float(np.clip(logit, -30.0, 30.0))
             return float(1.0 / (1.0 + np.exp(-logit)))
 
 
         z = (self.params.get("buybox_intercept", 1.0)
              + self.params.get("buybox_gap_coef", -12.0) * gap
+             + self.params.get("buybox_abs_gap_coef", -4.0) * abs_gap
              + self.params.get("buybox_fba_coef", 0.5) * self.own_fba
              + self.params.get("buybox_prime_coef", 0.5) * self.own_prime
              + self.params.get("buybox_feedback_coef", 0.1) * self.own_feedback)
@@ -517,8 +599,17 @@ class MarketEnv:
         if self.params.get("cost") is None:
             self.params["cost"] = 0.6 * self.own_price
 
-        self.comp_price = float(self.params["reference_price"])
-        self.comp_cost = 0.6 * self.comp_price
+        # Ground the RL competitor in the SAME listing, not a different ASIN's cluster
+        # median. Real Amazon buy-box competition is multiple SELLERS of the identical
+        # product -- comp_prices/reference_price (built from other, merely similar ASINs
+        # the clustering step grouped together) is the right stand-in for the *scripted*
+        # strategies (static/undercutter/matcher/promo_cycler), which really are meant to
+        # represent the broader market. But for self-play specifically, starting the rival
+        # from a different product's price/cost handed it a structural advantage that had
+        # nothing to do with strategy -- same item, same starting price and cost, so any
+        # difference in outcome reflects the two learned policies, not an inherited edge.
+        self.comp_price = self.own_price
+        self.comp_cost = self.params["cost"]
         self._comp_pending = None
         return self._state()
 
